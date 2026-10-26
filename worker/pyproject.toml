@@ -1,0 +1,36 @@
+[project]
+name = "vgworker"
+version = "0.1.0"
+description = "GPU model worker for voice-gateway: VoxCPM2 streaming TTS, emotion2vec tone, ECAPA speaker similarity"
+authors = [
+    { name = "suryxnshsingh", email = "suryxnshsingh@gmail.com" }
+]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.162.0",
+    "funasr>=1.4.16",
+    "numpy>=2.5.4",
+    "python-multipart>=0.0.32",
+    "soundfile>=0.14.0",
+    "soxr>=1.1.0",
+    "speechbrain>=1.0",
+    "uvicorn[standard]>=0.54.0",
+    "voxcpm==2.0.3",
+]
+
+[project.scripts]
+vgworker = "vgworker.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.12.19,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

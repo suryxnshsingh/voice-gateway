@@ -1,0 +1,6 @@
+voxcpm-src/
+ckpt/
+datasets/*/wavs/
+.venv/
+models/
+eval/

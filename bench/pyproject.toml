@@ -1,0 +1,19 @@
+[project]
+name = "vg-bench"
+version = "0.1.0"
+description = "Benchmarks for voice-gateway: STT providers and reply LLMs"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "voicegw",
+    "mlx-whisper>=0.4",
+    "transformers>=4.50",
+    "torch",
+    "indic-transliteration",
+    "soundfile",
+]
+
+[tool.uv.sources]
+voicegw = { path = "../gateway", editable = true }
+
+[tool.uv]
+package = false

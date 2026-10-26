@@ -1,0 +1,25 @@
+# secrets
+.env
+# environments and caches
+.venv/
+__pycache__/
+.pytest_cache/
+# runtime data: voices, consent recordings, database, opener caches
+data/
+# source recordings and training material (people's voices; keep out of git)
+data-raw/
+training/datasets/
+training/ckpt/
+training/models/
+training/eval/
+training/voxcpm-src/
+# audio and model artifacts
+*.wav
+*.mp3
+*.m4a
+*.webm
+*.aiff
+*.sqlite3
+*.safetensors
+*.pth
+.DS_Store
