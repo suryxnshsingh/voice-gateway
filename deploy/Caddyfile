@@ -1,7 +1,8 @@
 # Dhvni API. Caddy gets and renews the certificates itself (needs ports 80 and 443 open and
 # DNS pointing here). The sslip.io name works before api.dhvni.in has a DNS record.
 api.dhvni.in, 154-201-127-159.sslip.io {
-	# Operator-only routes stay on the machine.
+	# Operator-only routes and the internal voice agent (local keys, not billed) stay on the machine.
 	respond /internal/* 404
+	respond /v1/realtime* 404
 	reverse_proxy 127.0.0.1:8080
 }

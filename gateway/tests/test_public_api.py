@@ -163,3 +163,18 @@ def test_self_serve_cloning_and_internals_are_hidden(api):
     assert r.status_code == 404
     assert client.get("/health").json() == {"ok": True}
     assert "/v1/realtime/sessions" not in client.get("/openapi.json").json()["paths"]
+
+
+def test_voice_agent_is_closed_when_the_playground_is_off(api, monkeypatch):
+    from starlette.websockets import WebSocketDisconnect
+
+    client, auth, voice, app = api
+    key = auth["Authorization"].removeprefix("Bearer ")
+    monkeypatch.setattr(settings, "playground_enabled", False)
+    assert client.post("/v1/realtime/sessions", headers=auth).status_code == 404
+    assert client.post("/v1/realtime/sessions").status_code == 404  # before any key check
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(f"/v1/realtime", headers={"Authorization": f"Bearer {key}"}) as ws:
+            ws.receive_json()
+    monkeypatch.setattr(settings, "playground_enabled", True)
+    assert client.post("/v1/realtime/sessions", headers=auth).status_code == 200

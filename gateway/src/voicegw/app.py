@@ -7,7 +7,7 @@ import wave
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 
@@ -138,7 +138,14 @@ async def internal_health(request: Request):
 # realtime
 
 
-@app.post("/v1/realtime/sessions", include_in_schema=False)
+def _agent_enabled() -> None:
+    """The voice agent runs on the gateway's local keys and isn't billed through the dashboard, so it is
+    only open where the playground is (VG_PLAYGROUND_ENABLED); off on the public deployment."""
+    if not settings.playground_enabled:
+        raise HTTPException(404, "Not Found")
+
+
+@app.post("/v1/realtime/sessions", include_in_schema=False, dependencies=[Depends(_agent_enabled)])
 async def create_session_token(customer: Customer = LocalCustomer):
     """For browsers, which can't put an API key on a WebSocket. The token is good for one connect within 2 minutes."""
     token, exp = mint_session_token(customer.id)
@@ -147,6 +154,9 @@ async def create_session_token(customer: Customer = LocalCustomer):
 
 @app.websocket("/v1/realtime")
 async def realtime(ws: WebSocket, token: str | None = Query(None)):
+    if not settings.playground_enabled:
+        await ws.close()  # refuses the handshake
+        return
     db: DB = ws.app.state.db
     customer = None
     key = bearer(ws.headers.get("authorization"))
