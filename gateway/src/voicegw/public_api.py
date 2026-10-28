@@ -86,7 +86,7 @@ class Meter:
 
 
 async def _check_credit(app, customer: Customer) -> None:
-    if not settings.require_credit:
+    if not settings.require_credit or customer.free:
         return
     balance = await app.state.accounts.balance_paise(customer)
     if balance is not None and balance <= 0:

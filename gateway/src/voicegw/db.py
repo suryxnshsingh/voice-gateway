@@ -100,6 +100,7 @@ class Customer:
     id: str
     name: str
     key_id: int | None = None   # the Supabase api_keys row the request came in with
+    free: bool = False          # an admin in the dashboard playground: no credit check, priced at 0 by Supabase
 
 
 class DB:

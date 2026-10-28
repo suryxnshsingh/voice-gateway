@@ -23,6 +23,7 @@ class FakePostgrest:
 
     def __init__(self):
         self.status = "active"
+        self.role = "user"
         self.revoked_at = None
         self.balance = 50000
         self.down = False
@@ -52,9 +53,11 @@ class FakePostgrest:
                 403, json={"code": "bad_jwt", "message": "invalid JWT"})
         if path == "/profiles":
             assert request.url.params["id"] == f"eq.{USER}"
-            return httpx.Response(200, json=[{"status": self.status}])
+            return httpx.Response(200, json=[{"status": self.status, "role": self.role}])
         if path == "/api_keys":
-            assert request.url.params["id"] == "eq.7" and request.url.params["user_id"] == f"eq.{USER}"
+            assert request.url.params["user_id"] == f"eq.{USER}"
+            if request.url.params["id"] != "eq.7":
+                return httpx.Response(200, json=[])  # not one of this account's keys
             return httpx.Response(200, json=[{"revoked_at": self.revoked_at, "profiles": {"status": self.status}}])
         if path == "/voices":
             assert request.url.params["or"] == f"(user_id.eq.{USER},user_id.is.null)"
@@ -225,19 +228,50 @@ def test_stream_engine_failure_reaches_the_client(sb):
 
 
 async def test_dashboard_session_works_like_a_key(sb):
-    """The dashboard's playground calls the API with the signed in session instead of a key."""
+    """The dashboard's playground calls the API with the signed in session, billed to a key it names."""
     client, _, fake, db, sync = sb
-    session = {"Authorization": f"Bearer {SESSION}"}
+    session = {"Authorization": f"Bearer {SESSION}", "X-Api-Key-Id": "7"}
     assert [v["id"] for v in client.get("/v1/voices", headers=session).json()["voices"]] == ["voice_mine123", "voice_shared1"]
     r = client.post("/v1/tts", headers=session, json={"voice_id": "voice_mine123", "text": "नमस्ते बेटा।", "format": "pcm",
                                                       "stream": True})
     assert r.status_code == 200 and len(r.content) > 0
     assert await sync.flush() == 1
     row = next(iter(fake.usage.values()))
-    assert row["user_id"] == USER and row["api_key_id"] is None and row["endpoint"] == "tts"
+    assert row["user_id"] == USER and row["api_key_id"] == 7 and row["endpoint"] == "tts"
     bad = client.get("/v1/voices", headers={"Authorization": "Bearer eyJx.eyJy.expired"})
     assert bad.status_code == 401
     fake.status = "pending"
     client.app.state.accounts._cache.clear()
     r = client.get("/v1/voices", headers=session)
     assert r.status_code == 403 and "approval" in r.json()["detail"]
+
+
+def test_a_customer_session_needs_one_of_their_keys(sb):
+    client, _, fake, _, _ = sb
+    bare = {"Authorization": f"Bearer {SESSION}"}
+    r = client.post("/v1/tts", headers=bare, json={"voice_id": "voice_mine123", "text": "हाँ।"})
+    assert r.status_code == 400 and "API keys" in r.json()["detail"]
+    other = client.post("/v1/tts", headers={**bare, "X-Api-Key-Id": "8"}, json={"voice_id": "voice_mine123", "text": "हाँ।"})
+    assert other.status_code == 403
+    assert client.get("/v1/voices", headers={**bare, "X-Api-Key-Id": "seven"}).status_code == 400
+    fake.revoked_at = "2026-10-29T10:00:00+00:00"
+    client.app.state.accounts._cache.clear()
+    revoked = client.get("/v1/voices", headers={**bare, "X-Api-Key-Id": "7"})
+    assert revoked.status_code == 403 and "revoked" in revoked.json()["detail"]
+
+
+async def test_an_admin_session_without_a_key_is_free(sb, monkeypatch):
+    """Admins try things in the playground without a key: no credit check, and no key on the usage row,
+    which Supabase prices at 0."""
+    client, _, fake, _, sync = sb
+    fake.role, fake.balance = "admin", 0
+    monkeypatch.setattr(settings, "require_credit", True)
+    admin = {"Authorization": f"Bearer {SESSION}"}
+    r = client.post("/v1/tts", headers=admin, json={"voice_id": "voice_mine123", "text": "हाँ।", "format": "pcm"})
+    assert r.status_code == 200
+    assert client.post("/v1/stt", headers=admin, files={"file": ("q.wav", b"audio", "audio/wav")}).status_code == 200
+    assert await sync.flush() == 2
+    assert {row["api_key_id"] for row in fake.usage.values()} == {None}
+    # With a key, an admin is billed like anyone else.
+    keyed = client.post("/v1/tts", headers={**admin, "X-Api-Key-Id": "7"}, json={"voice_id": "voice_mine123", "text": "हाँ।"})
+    assert keyed.status_code == 402

@@ -63,14 +63,15 @@ def looks_like_session(token: str) -> bool:
 
 async def customer_from(request: Request) -> Customer:
     """FastAPI dependency for the public API: Authorization: Bearer <api key>, or a signed in dashboard
-    session for the playground, checked by app.state.accounts (Supabase in production). Raises 401 for an
-    unknown key and 403 for an account that isn't active."""
+    session for the playground, checked by app.state.accounts (Supabase in production). A session names
+    the API key it is billed to in X-Api-Key-Id; admins may leave it out. Raises 401 for an unknown key
+    and 403 for an account that isn't active."""
     key = bearer(request.headers.get("authorization"))
     accounts = request.app.state.accounts
     if not key:
         customer = None
     elif looks_like_session(key):
-        customer = await accounts.for_session(key)
+        customer = await accounts.for_session(key, request.headers.get("x-api-key-id"))
     else:
         customer = await accounts.for_key(key)
     if customer is None:

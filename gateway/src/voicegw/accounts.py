@@ -69,7 +69,7 @@ class LocalAccounts:
     async def for_token(self, claims: dict) -> Customer | None:
         return self.db.customer(claims["c"])
 
-    async def for_session(self, access_token: str) -> Customer | None:
+    async def for_session(self, access_token: str, key_id: str | None = None) -> Customer | None:
         return None
 
     async def voices(self, customer: Customer) -> list[dict]:
@@ -148,8 +148,12 @@ class SupabaseAccounts:
         _require_active(row["status"])
         return Customer(id=row["user_id"], name="", key_id=row["api_key_id"])
 
-    async def for_session(self, access_token: str) -> Customer | None:
-        """A dashboard session: Supabase Auth says whose it is, the profile says whether it may be used."""
+    async def for_session(self, access_token: str, key_id: str | None = None) -> Customer | None:
+        """A dashboard session: Supabase Auth says whose it is, the profile says whether it may be used.
+
+        A customer's playground names one of their live API keys (`key_id`), and its requests count
+        against that key like any other. An admin may leave it out: those requests skip the credit check
+        and Supabase prices them at 0, since they carry no key."""
         digest = hashlib.sha256(access_token.encode()).hexdigest()
 
         async def user():
@@ -165,14 +169,30 @@ class SupabaseAccounts:
             return None
 
         async def profile():
-            rows = await self._call("GET", "/profiles", params={"select": "status", "id": f"eq.{user_id}"})
-            return rows[0]["status"] if rows else None
+            rows = await self._call("GET", "/profiles", params={"select": "status,role", "id": f"eq.{user_id}"})
+            return (rows[0]["status"], rows[0].get("role")) if rows else None
 
-        status = await self._cached(("profile", user_id), profile)
-        if status is None:
+        found = await self._cached(("profile", user_id), profile)
+        if found is None:
             return None
+        status, role = found
         _require_active(status)
-        return Customer(id=user_id, name="")
+
+        if not key_id:
+            if role == "admin":
+                return Customer(id=user_id, name="", free=True)
+            raise HTTPException(400, "Choose one of your API keys to use the playground.")
+        if not key_id.isdigit():
+            raise HTTPException(400, "X-Api-Key-Id must be the id of one of your API keys.")
+
+        async def key():
+            return await self._call("GET", "/api_keys", params={
+                "select": "revoked_at", "id": f"eq.{key_id}", "user_id": f"eq.{user_id}"})
+
+        rows = await self._cached(("session_key", key_id, user_id), key)
+        if not rows or rows[0]["revoked_at"] is not None:
+            raise HTTPException(403, "That API key is revoked or not on this account. Choose another one.")
+        return Customer(id=user_id, name="", key_id=int(key_id))
 
     async def for_token(self, claims: dict) -> Customer | None:
         """A browser token minted from a key: the key must still be live and the account active."""
