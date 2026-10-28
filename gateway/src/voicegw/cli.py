@@ -150,7 +150,41 @@ def cmd_consents(args) -> None:
 
 def cmd_usage(args) -> None:
     now = time.time()
-    print(json.dumps(_db().usage_summary(args.customer, now - args.days * 86400, now), indent=2))
+    db, since = _db(), now - args.days * 86400
+    print(json.dumps({"api": db.request_totals(args.customer, since, now),
+                      "agent": db.usage_summary(args.customer, since, now)}, indent=2))
+
+
+def cmd_check(args) -> None:
+    """Supabase reachable with this key? Every live voice's audio on this gateway? Usage flowing?"""
+    from .accounts import SupabaseAccounts
+    from .config import settings
+
+    if not settings.supabase_url:
+        sys.exit("VG_SUPABASE_URL is not set: this gateway uses its local database for accounts.")
+
+    async def run():
+        acc = SupabaseAccounts(settings.supabase_url, settings.supabase_secret_key)
+        try:
+            await acc._call("POST", "/rpc/verify_api_key", json={"p_key": "vg_check"})
+            return await acc._call("GET", "/voices", params={"select": "id,name,status,user_id", "order": "created_at"})
+        finally:
+            await acc.close()
+
+    try:
+        voices = asyncio.run(run())
+    except Exception as e:
+        sys.exit(f"Supabase check failed: {e}")
+    print(f"Supabase: ok ({settings.supabase_url})")
+    missing = 0
+    for v in voices:
+        here = (settings.voices_dir / v["id"] / "reference.wav").exists()
+        missing += v["status"] == "active" and not here
+        print(f"  {v['id']}  {v['status']:<8}  {'shared' if v['user_id'] is None else 'account ' + v['user_id'][:8]}"
+              f"  {'audio here' if here else 'NO AUDIO HERE'}  {v['name']}")
+    print(f"Request log: {_db().request_counts()}")
+    if missing:
+        sys.exit(f"{missing} live voice(s) have no reference audio on this gateway; requests for them get 503.")
 
 
 def cmd_talk(args) -> None:
@@ -210,6 +244,9 @@ def main() -> None:
     s.add_argument("customer")
     s.add_argument("--days", type=float, default=30)
     s.set_defaults(fn=cmd_usage)
+
+    sub.add_parser("check", help="check the Supabase connection and that every live voice has its audio here"
+                   ).set_defaults(fn=cmd_check)
 
     s = sub.add_parser("talk", help="dev client: send audio files as user turns, save the spoken replies")
     s.add_argument("files", nargs="+", help="one audio file per user turn")

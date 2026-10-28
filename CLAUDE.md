@@ -12,7 +12,9 @@ Two Python services plus tooling:
 - **`worker/`** (`vgworker`, GPU) is internal only, called by the gateway. It does VoxCPM2 streaming TTS, emotion2vec tone and ECAPA speaker similarity.
 - **`bench/`** holds the STT, LLM and TTS benchmarks. **`training/`** holds the VoxCPM2 LoRA fine-tuning pipeline for teacher voices.
 
-`README.md` is the operator guide: onboarding customers, production settings, measured latencies. `training/README.md` covers fine-tuning.
+`README.md` is the operator guide: onboarding customers, production settings, measured latencies. `deploy/README.md` describes the production VM (systemd, Caddy, update steps). `training/README.md` covers fine-tuning.
+
+In production, the public API's accounts, keys, voices and usage log live in the Dhvni dashboard's Supabase project. The dashboard code is in `~/Developer/1cr/dhvni-web`; its README section "What the voice gateway needs to do" is the contract, and its `supabase/migrations` define the tables and functions the gateway calls.
 
 ## Commands
 
@@ -29,6 +31,7 @@ uv run voicegw create-customer "Name"            # prints the API key once
 uv run voicegw import-voice --customer cust_... --name ... --speaker ... --reference f.wav --attestation "..." --operator ...
 uv run voicegw replace-reference <voice_id> f.wav --operator ...   # refuses a different speaker
 uv run voicegw set-persona <voice_id> --persona-file personas/x.txt --greeting "..."
+uv run voicegw check                             # Supabase reachable; every live voice has its audio here
 uv run voicegw talk q1.wav q2.wav --api-key ... --voice ...          # scripted voice-agent turns, prints latencies
 
 cd worker
@@ -67,7 +70,14 @@ The core is one `Session` per WebSocket: an asyncio state machine. The module do
 - **Barge-in has two stages.** VAD speech while the reply is audible pauses playout; the VAD bar is higher during a reply. Real words (`bargein.py` filters backchannels and echo) or long speech cancel the reply. Silence resumes it.
   - **Carry:** if the user kept talking before any audio played, the turn text carries into the next turn.
 
-### Public API (`public_api.py`, `app.py`)
+### Public API (`public_api.py`, `app.py`, `accounts.py`)
+
+- **Accounts.** Public routes resolve keys and voices through `app.state.accounts`:
+  - `SupabaseAccounts` is used when `VG_SUPABASE_URL` is set. It calls PostgREST with the secret key: `verify_api_key` and `credit_balance` RPCs, and the `voices` and `api_keys` tables. Answers are cached for 30 s, and stale ones serve for up to 10 min during an outage.
+  - `LocalAccounts` (SQLite) is used otherwise.
+  - Internal routes (`/v1/realtime*`, self-serve cloning) always use the local DB, through `auth.LocalCustomer`.
+- **Ownership vs audio.** With Supabase, the `voices` table decides who may use a voice, but the reference audio is still only on the gateway (`data/voices/<id>/reference.wav`). A live voice without local audio gets 503.
+- **Request log.** Every TTS/STT request past auth goes through `Meter`, which writes one row to the local `requests` table (failures too, with their status). `accounts.UsageSync` copies pending rows to Supabase `usage_events` in batches, on conflict do nothing. A row Supabase refuses is marked `failed: ...` so the rest still flow. `/v1/usage` sums successful rows locally.
 
 - **Branding is a hard requirement.** Engine names (OpenAI, gpt-*, VoxCPM, Soniox) must never appear in responses, errors, headers, `/v1/usage` or OpenAPI. `tests/test_public_api.py` checks this.
 - **Errors:** upstream failures map to neutral messages, in `providers/transcribe.py` for STT and `_engine_error` for TTS.
@@ -96,18 +106,20 @@ The core is one `Session` per WebSocket: an asyncio state machine. The module do
 - **ffmpeg can't write a valid WAV header to a pipe.** `audio.ffmpeg_convert` decodes to s16le and builds the header in Python.
 - **TTS reads Hindi best in Devanagari with English terms in Latin script.** `VOICE_RULES` and the training transcripts follow this. Write numbers as spoken words, not digits.
 - **One worker serves one model** (`VG_WORKER_TTS_MODEL`). With a fine-tune loaded, every voice is rendered by that fine-tune.
+- **Browser tokens** (`vgs_...`) carry the Supabase key id (`k`). With Supabase, a token stops working when its key is revoked or the account stops being active.
+- **Tests that override `app.state.db` must also set `app.state.accounts`** (`LocalAccounts(db)`), and point `settings.data_dir` at a temp dir with a `reference.wav` for each voice. `tests/test_supabase.py` fakes PostgREST with `httpx.MockTransport`.
 - **Every voice needs a consent record** (`consents` table). `import-voice` requires `--attestation`, and `replace-reference` refuses a different speaker. Raw recordings and training data are gitignored and must stay out of git.
 
 ## Configuration
 
-- **Gateway:** pydantic settings with prefix `VG_` (`gateway/src/voicegw/config.py`). Session-level knobs (VAD, barge-in, drafts, Smart Turn, openers) live in `SessionConfig` in `session.py`.
+- **Gateway:** pydantic settings with prefix `VG_` (`gateway/src/voicegw/config.py`). Supabase is enabled by `VG_SUPABASE_URL` plus `VG_SUPABASE_SECRET_KEY`. `VG_REQUIRE_CREDIT` (default off) returns 402 when the prepaid balance is used up. Session-level knobs (VAD, barge-in, drafts, Smart Turn, openers) live in `SessionConfig` in `session.py`.
   - **`.env` is read from the current directory.** That's why the gateway and `bench/llm_bench.py` run from `gateway/`. `bench/stt_bench.py`, `bench/tts_sweep.py` and `training/prepare_dataset.py` load `gateway/.env` explicitly instead.
   - **The local `gateway/.env` (gitignored) overrides several defaults:** OpenAI STT first (Soniox is unfunded), `VG_LLM_SERVICE_TIER=priority` and `VG_PLAYOUT_PREBUFFER_MS=250`. Don't infer runtime behaviour from `config.py` alone. `.env.example` lists the keys.
 - **Worker:** env prefix `VG_WORKER_` (`worker/src/vgworker/config.py`). `scripts/dev.sh` starts the **base** model. To serve the fine-tune, export `VG_WORKER_TTS_MODEL=$(pwd)/training/models/ritesh-voxcpm2-step250` first; it's gitignored and exists only locally.
 
 ## Runtime data and debugging
 
-- **`gateway/data/`** holds the SQLite DB (customers, hashed keys, voices, consents, usage). Each voice has `voices/<id>/` with its reference, earlier references, consent recordings and the opener cache.
+- **`gateway/data/`** holds the SQLite DB (customers, hashed keys, voices, consents, agent usage, and the public `requests` log with its Supabase `sync` state). Each voice has `voices/<id>/` with its reference, earlier references, consent recordings and the opener cache.
 - **`worker/data/voices/`** is the worker's own copy of each reference. The gateway re-pushes a voice when the worker answers `voice_not_found`.
 - **Health:**
   - `curl localhost:8000/internal/health` (localhost only) shows engine details.

@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import io
 import logging
 import time
@@ -6,11 +8,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 
 from . import consent
+from .accounts import LocalAccounts, SupabaseAccounts, UsageSync, public_voice
 from .audio import AudioError, ffmpeg_convert, pcm_seconds
-from .auth import CurrentCustomer, bearer, mint_session_token, read_session_token
+from .auth import CurrentCustomer, LocalCustomer, bearer, mint_session_token, read_session_token
 from .config import settings
 from .db import DB, Customer
 from .providers import stt
@@ -37,7 +41,25 @@ async def lifespan(app: FastAPI):
     app.state.transcriber = Transcriber(settings.openai_key, settings.stt_relay_model)
     app.state.limiter = Limiter(settings.requests_per_minute,
                                 {"tts": settings.tts_concurrency, "stt": settings.stt_concurrency})
+    sync = None
+    if settings.supabase_url:
+        if not settings.supabase_secret_key:
+            raise RuntimeError("VG_SUPABASE_URL is set but VG_SUPABASE_SECRET_KEY is not")
+        app.state.accounts = SupabaseAccounts(settings.supabase_url, settings.supabase_secret_key, settings.accounts_cache_s)
+        sync = UsageSync(app.state.db, app.state.accounts.http)
+        sync_task = asyncio.create_task(sync.run())
+        log.info("accounts: Supabase %s", settings.supabase_url)
+    else:
+        app.state.accounts = LocalAccounts(app.state.db)
+        log.info("accounts: local database")
+    app.state.usage_sync = sync
     yield
+    if sync:
+        sync_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sync_task
+        await sync.drain()
+    await app.state.accounts.close()
     await app.state.worker.close()
 
 
@@ -52,23 +74,14 @@ app = FastAPI(
     redoc_url=None,
 )
 app.include_router(public_router)
+# The API authenticates with bearer keys, never cookies, so any site may call it (the dashboard, a
+# customer's own front end with a browser token).
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+                   expose_headers=["X-Request-Id", "X-Audio-Seconds", "Retry-After"])
 
 
 def _deps(app: FastAPI) -> Deps:
     return Deps(app.state.db, app.state.worker, app.state.llm, settings)
-
-
-def public_voice(v: dict) -> dict:
-    return {
-        "id": v["id"],
-        "name": v["name"],
-        "speaker_name": v["speaker_name"],
-        "status": v["status"],
-        "shared": v["customer_id"] is None,
-        "reference_seconds": v["reference_seconds"],
-        "created_at": v["created_at"],
-        "activated_at": v["activated_at"],
-    }
 
 
 async def _read_upload(f: UploadFile) -> bytes:
@@ -117,14 +130,16 @@ async def internal_health(request: Request):
     except Exception as e:
         worker = {"error": str(e)}
     return {"ok": "error" not in worker, "worker": worker, "llm": request.app.state.llm.available,
-            "stt_providers": settings.stt_providers, "stt_relay": settings.stt_relay_model}
+            "stt_providers": settings.stt_providers, "stt_relay": settings.stt_relay_model,
+            "accounts": "supabase" if request.app.state.accounts.remote else "local",
+            "requests": request.app.state.db.request_counts()}
 
 
 # realtime
 
 
 @app.post("/v1/realtime/sessions", include_in_schema=False)
-async def create_session_token(customer: Customer = CurrentCustomer):
+async def create_session_token(customer: Customer = LocalCustomer):
     """For browsers, which can't put an API key on a WebSocket. The token is good for one connect within 2 minutes."""
     token, exp = mint_session_token(customer.id)
     return {"token": token, "expires_at": exp}
@@ -155,15 +170,15 @@ async def realtime(ws: WebSocket, token: str | None = Query(None)):
 
 @app.get("/v1/voices", tags=["voices"], summary="List your voices")
 async def list_voices(request: Request, customer: Customer = CurrentCustomer):
-    return {"voices": [public_voice(v) for v in request.app.state.db.voices_for(customer.id) if v["status"] == "active"]}
+    return {"voices": await request.app.state.accounts.voices(customer)}
 
 
 @app.get("/v1/voices/{voice_id}", tags=["voices"], summary="Get a voice")
 async def get_voice(voice_id: str, request: Request, customer: Customer = CurrentCustomer):
-    v = request.app.state.db.voice_for(customer.id, voice_id)
+    v = await request.app.state.accounts.voice(customer, voice_id)
     if v is None:
-        raise HTTPException(404, "voice not found")
-    return public_voice(v)
+        raise HTTPException(404, f"Voice {voice_id} not found on this account.")
+    return v
 
 
 def _self_serve_only() -> None:
@@ -178,7 +193,7 @@ async def create_voice(
     speaker_name: str = Form(..., max_length=100),
     language: str = Form("en", pattern="^(en|hi)$"),
     reference: UploadFile = File(...),
-    customer: Customer = CurrentCustomer,
+    customer: Customer = LocalCustomer,
 ):
     """Step 1 of cloning: upload a reference recording. The voice stays unusable until the speaker records consent."""
     _self_serve_only()
@@ -213,7 +228,7 @@ async def create_voice(
 
 @app.post("/v1/voices/{voice_id}/consent", include_in_schema=settings.self_serve_voices)
 async def submit_consent(voice_id: str, request: Request, recording: UploadFile = File(...),
-                         customer: Customer = CurrentCustomer):
+                         customer: Customer = LocalCustomer):
     """Step 2: the speaker's recorded consent. Activates the voice if the code words and the speaker both match."""
     _self_serve_only()
     db: DB = request.app.state.db
@@ -273,7 +288,7 @@ async def submit_consent(voice_id: str, request: Request, recording: UploadFile 
 
 
 @app.delete("/v1/voices/{voice_id}", include_in_schema=settings.self_serve_voices)
-async def delete_voice(voice_id: str, request: Request, customer: Customer = CurrentCustomer):
+async def delete_voice(voice_id: str, request: Request, customer: Customer = LocalCustomer):
     """Revoke a clone. Reference audio is deleted; consent records stay for audit."""
     _self_serve_only()
     db: DB = request.app.state.db
@@ -298,12 +313,9 @@ PUBLIC_USAGE = {"tts_characters": "characters", "tts_seconds": "seconds", "stt_s
 @app.get("/v1/usage", tags=["usage"], summary="Your usage")
 async def usage(request: Request, since: float | None = None, until: float | None = None,
                 customer: Customer = CurrentCustomer):
-    """Totals per metered unit (unix-second window, default the last 30 days)."""
+    """Billable totals of successful requests (unix-second window, default the last 30 days)."""
     until = until or time.time()
     since = since or until - 30 * 86400
-    totals: dict[str, float] = {}
-    for row in request.app.state.db.usage_summary(customer.id, since, until):
-        if row["kind"] in PUBLIC_USAGE:  # engines and internal agent metering stay internal
-            totals[row["kind"]] = totals.get(row["kind"], 0) + row["quantity"]
+    totals = request.app.state.db.request_totals(customer.id, since, until)
     return {"since": since, "until": until,
-            "usage": [{"metric": k, "quantity": round(v, 2), "unit": PUBLIC_USAGE[k]} for k, v in sorted(totals.items())]}
+            "usage": [{"metric": k, "quantity": round(totals[k], 2), "unit": unit} for k, unit in sorted(PUBLIC_USAGE.items())]}

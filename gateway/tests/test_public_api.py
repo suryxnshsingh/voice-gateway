@@ -5,6 +5,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from voicegw.accounts import LocalAccounts
 from voicegw.config import settings
 from voicegw.db import DB
 from voicegw.limits import Limiter
@@ -47,17 +48,22 @@ class FakeTranscriber:
 
 
 @pytest.fixture
-def api(tmp_path):
+def api(tmp_path, monkeypatch):
     from voicegw.app import app
 
     with TestClient(app) as client:
+        monkeypatch.setattr(settings, "data_dir", tmp_path)
         db = DB(tmp_path / "t.sqlite3")
         app.state.db, app.state.worker, app.state.transcriber = db, FakeWorker(), FakeTranscriber()
+        app.state.accounts = LocalAccounts(db)
         app.state.limiter = Limiter(1000, {"tts": 4, "stt": 4})
         cust = db.create_customer("Acme")
         key = db.create_api_key(cust.id)
         voice = db.create_voice(customer_id=cust.id, name="Ritesh Sir", speaker_name="Ritesh", reference_seconds=8,
                                 consent_phrase=None, consent_code=None, consent_expires_at=None, status="active")
+        db.activate_voice(voice["id"])
+        (tmp_path / "voices" / voice["id"]).mkdir(parents=True)
+        (tmp_path / "voices" / voice["id"] / "reference.wav").write_bytes(b"RIFF")
         yield client, {"Authorization": f"Bearer {key}"}, voice, app
 
 
@@ -76,9 +82,11 @@ def test_tts_file_and_metering(api):
     assert r.status_code == 200 and r.headers["content-type"] == "audio/wav" and r.content[:4] == b"RIFF"
     assert r.headers["x-request-id"].startswith("req_") and float(r.headers["x-audio-seconds"]) == 0.06
     assert app.state.worker.calls[0][2] == 10  # hq = 10 diffusion steps
-    usage = client.get("/v1/usage", headers=auth).json()["usage"]
-    assert {u["metric"] for u in usage} == {"tts_characters", "tts_seconds"}
-    assert all(set(u) == {"metric", "quantity", "unit"} for u in usage)  # no engine/provider fields
+    usage = {u["metric"]: u for u in client.get("/v1/usage", headers=auth).json()["usage"]}
+    assert set(usage) == {"tts_characters", "tts_seconds", "stt_seconds"}
+    assert usage["tts_characters"]["quantity"] == len("देखो बेटा, revision ज़रूरी है।")
+    assert usage["tts_seconds"]["quantity"] == 0.06 and usage["stt_seconds"]["quantity"] == 0
+    assert all(set(u) == {"metric", "quantity", "unit"} for u in usage.values())  # no engine/provider fields
 
 
 def test_tts_mp3_is_encoded(api):

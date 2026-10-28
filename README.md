@@ -22,29 +22,42 @@ There are two services:
 
 The customer-facing API guide is [`docs/API.md`](docs/API.md), and an interactive reference is served at `/docs`.
 
-- **What customers see:** the brand "Swara" and the models `swara-voice-1` and `swara-transcribe-1`. Engine names never appear in responses, errors, headers, `/v1/usage` or the generated docs; tests check for leaks. Set the names with `VG_BRAND`, `VG_BRAND_TTS_MODEL` and `VG_BRAND_STT_MODEL`.
+- **What customers see:** the brand "Dhvni" and the models `dhvni-voice-1` and `dhvni-transcribe-1`. Engine names never appear in responses, errors, headers, `/v1/usage` or the generated docs; tests check for leaks. Set the names with `VG_BRAND`, `VG_BRAND_TTS_MODEL` and `VG_BRAND_STT_MODEL`.
 - **Endpoints:**
   - `POST /v1/tts` returns a file or a stream (mp3, opus, wav or pcm).
   - `WS /v1/tts/stream` takes text as it's written and returns PCM.
   - `POST /v1/stt` relays the file unchanged to `VG_STT_RELAY_MODEL` (default `gpt-transcribe`) and returns the text under the brand.
   - `GET /v1/voices`, `/v1/models` and `/v1/usage`.
-- **Measured locally** (M5 Pro, fine-tuned voice): first streamed audio byte in 300–480 ms, also after 90 s idle with keep-warm on.
+- **Measured:** first audio in about 80 ms on an NVIDIA L4 (fine-tuned voice, warm), rendering at 0.85× real time with one TTS copy. On the M5 Pro: 300–480 ms.
 - **Limits per customer:** 120 requests a minute, 4 concurrent TTS, 8 concurrent STT, 5,000 characters and 25 MB. They're in-process, so move them to Redis once there's more than one gateway.
+
+### Accounts: the Dhvni dashboard (Supabase)
+
+With `VG_SUPABASE_URL` and `VG_SUPABASE_SECRET_KEY` set, the public API takes its accounts from the dashboard's Supabase project (`~/Developer/1cr/dhvni-web`, whose README has the contract). Without them, it uses the gateway's own SQLite (development and tests).
+
+- **API keys** are the ones customers create at `/dashboard/keys`. The gateway checks them with `verify_api_key()`. An unknown or revoked key gets 401; an account that is pending or suspended gets 403.
+- **Voices** come from the `voices` table: an account's own, plus shared ones (no `user_id`). The audio stays on the gateway, in `gateway/data/voices/<id>/reference.wav`. A voice that is live in Supabase but has no audio here gets 503; `voicegw check` lists them.
+- **Usage.** Every TTS, streaming TTS and STT request that passes authentication is written to the local `requests` table first, failures included. `accounts.UsageSync` then copies rows to `usage_events` every 2 s, in batches, with `on conflict (request_id) do nothing`. If Supabase is down, rows wait and go out later. The database prices them; failed requests cost nothing.
+- **Caching.** Answers are cached for `VG_ACCOUNTS_CACHE_S` (30 s), so a revoked key or a new voice takes up to that long. While Supabase is unreachable, the last answer is used for up to 10 minutes.
+- **Credit.** `VG_REQUIRE_CREDIT=true` refuses TTS and STT with 402 once an account's prepaid balance (`credit_balance()`) is used up. It is off by default.
+- The internal voice agent (`/v1/realtime`) and self-serve cloning still use the local database.
 
 **Onboarding a customer** (operators):
 
-```bash
-cd gateway
-uv run voicegw create-customer "Acme Coaching"      # prints the customer id and their API key (shown once)
-# Clone a voice on their behalf. Get the speaker's written consent first and say where it's filed:
-uv run voicegw import-voice --customer cust_... --name "Priya Ma'am" --speaker "Priya Sharma" \
-    --reference priya_20s.wav --attestation "Signed release, Drive/consents/priya.pdf, 2026-10-27" --operator "<you>"
-uv run voicegw replace-reference <voice_id> better.wav --operator "<you>"   # better recording, same person only
-```
+1. They sign up on the site; an admin approves them at `/admin/accounts`; they create their own keys.
+2. For a voice, they send a voice request from `/dashboard/voices` with the recordings and consent. On the gateway machine, import it. `--customer` is any local customer (the dashboard decides who may use it):
+   ```bash
+   cd gateway
+   uv run voicegw import-voice --customer cust_... --name "Priya Ma'am" --speaker "Priya Sharma" \
+       --reference priya_20s.wav --attestation "Voice request #12, consent checked 2026-10-28" --operator "<you>"
+   uv run voicegw replace-reference <voice_id> better.wav --operator "<you>"   # better recording, same person only
+   ```
+3. Paste the printed voice id into "Make it live" at `/admin/voices`. It shows up in their `GET /v1/voices` within 30 s.
 
-The voice then shows up in that customer's `GET /v1/voices`. Self-serve cloning (`POST /v1/voices` and the consent recording) is off in v1; set `VG_SELF_SERVE_VOICES=true` to switch it on.
+Without Supabase, `uv run voicegw create-customer "Acme Coaching"` prints a local customer and key. Self-serve cloning (`POST /v1/voices` and the consent recording) is off in v1; set `VG_SELF_SERVE_VOICES=true` to switch it on.
 
-**Production settings:**
+**Production settings** (the running setup is in [`deploy/`](deploy/README.md)):
+- `VG_SUPABASE_URL` and `VG_SUPABASE_SECRET_KEY` connect the dashboard's accounts.
 - `VG_PLAYGROUND_ENABLED=false` hides the test page and the voice-agent WebSocket.
 - `VG_SECRET_KEY` must be a fixed random value.
 - `VG_WORKER_TOKEN` must be set on both services.
@@ -180,7 +193,9 @@ uv run voicegw import-voice --customer cust_… --name "Ritesh Sir" --speaker "R
 
 ## Usage metering
 
-Every session records `stt_seconds`, `llm_input_tokens`, `llm_output_tokens`, `tts_characters`, `tts_seconds` and `tone_calls` per customer, with provider and model. `GET /v1/usage?since=&until=` and `voicegw usage <customer>` return the totals. Billing is meant to be one rate card applied to these totals, the same for every customer, including Arivihan.
+- **Public API:** one row per request in `requests` (endpoint, characters, audio seconds, status, time to first audio), copied to the dashboard's `usage_events` when Supabase is set. `GET /v1/usage?since=&until=` returns the billable totals: `tts_characters`, `tts_seconds` and `stt_seconds` of successful requests.
+- **Voice agent:** every session records `stt_seconds`, `llm_input_tokens`, `llm_output_tokens`, `tts_characters`, `tts_seconds` and `tone_calls` per customer, with provider and model, in `usage_events`.
+- `voicegw usage <customer>` shows both. Billing is meant to be one rate card, the same for every customer, including Arivihan.
 
 ## Measured (M5 Pro, VoxCPM2 on MPS fp32, no CUDA)
 
@@ -209,7 +224,7 @@ cd ../gateway && uv run python ../bench/llm_bench.py --runs 3   # reply LLMs on 
 ## Tests
 
 ```bash
-cd gateway && uv run pytest     # 40 tests: session flow, drafts, smart turn, openers, persona, barge-in, STT failover, playout, VAD
+cd gateway && uv run pytest     # session flow, drafts, smart turn, openers, barge-in, STT failover, playout, VAD, public API, Supabase accounts
 cd worker && uv run pytest      # TTS pool: instances always come back, leaks heal
 ```
 

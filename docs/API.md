@@ -1,14 +1,14 @@
-# Swara API — v1
+# Dhvni API — v1
 
 Text-to-speech and speech-to-text for Hindi, English and Hinglish.
 
-- **Base URL:** `https://api.<your-domain>`. For local testing it's `http://127.0.0.1:8000`.
+- **Base URL:** `https://api.dhvni.in`. For local testing it's `http://127.0.0.1:8000`.
 - **Interactive reference:** `/docs`.
-- **Models:** `swara-voice-1` (text-to-speech) and `swara-transcribe-1` (speech-to-text).
+- **Models:** `dhvni-voice-1` (text-to-speech) and `dhvni-transcribe-1` (speech-to-text).
 
 ## Authentication
 
-Every request needs your API key:
+Every request needs an API key from the dashboard (`/dashboard/keys`):
 
 ```
 Authorization: Bearer vg_...
@@ -21,7 +21,7 @@ Browsers can't set headers on WebSockets. In a browser, call `POST /v1/tokens` f
 Your voices are set up for you by our team. List them to fill a voice picker:
 
 ```bash
-curl https://api.<your-domain>/v1/voices -H "Authorization: Bearer $KEY"
+curl https://api.dhvni.in/v1/voices -H "Authorization: Bearer $KEY"
 ```
 ```json
 {"voices": [{"id": "voice_19d9ec2eae586ac7", "name": "Ritesh Sir", "status": "active", "created_at": 1792966000}]}
@@ -41,7 +41,7 @@ curl https://api.<your-domain>/v1/voices -H "Authorization: Bearer $KEY"
 | `stream` | `false` | `true`: audio starts arriving in about 0.3 s and keeps coming as it's generated |
 
 ```bash
-curl https://api.<your-domain>/v1/tts -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+curl https://api.dhvni.in/v1/tts -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"voice_id":"voice_19d9ec2eae586ac7","text":"नमस्ते बेटा! आज हम photosynthesis पढ़ेंगे।","format":"mp3"}' \
   -o hello.mp3
 ```
@@ -63,7 +63,7 @@ for await (const chunk of r.body) playPcm16(chunk);   // feed your audio player 
 Use this when text arrives piece by piece, for example from your own LLM.
 
 ```
-wss://api.<your-domain>/v1/tts/stream?voice_id=voice_...&sample_rate=24000&quality=fast
+wss://api.dhvni.in/v1/tts/stream?voice_id=voice_...&sample_rate=24000&quality=fast
 ```
 
 | You send | Effect |
@@ -78,7 +78,9 @@ wss://api.<your-domain>/v1/tts/stream?voice_id=voice_...&sample_rate=24000&quali
 | `{"type":"ready", "request_id", "sample_rate"}` | connected |
 | binary frames | PCM16 little-endian mono audio, in order |
 | `{"type":"chunk.done", "text", "audio_ms"}` | one piece finished |
-| `{"type":"cancelled"}`, `{"type":"done", "characters", "audio_ms"}`, `{"type":"error", "message"}` | |
+| `{"type":"cancelled"}`, `{"type":"done", "characters", "audio_ms"}`, `{"type":"error", "message"}` | `characters` counts the text actually spoken; text dropped by a cancel is not billed |
+
+The connection closes with code `4401` for a missing, wrong or expired key or token, `4403` for an account that isn't active, and `4400` for a bad `sample_rate` or `quality`.
 
 ## Speech-to-text
 
@@ -92,10 +94,10 @@ wss://api.<your-domain>/v1/tts/stream?voice_id=voice_...&sample_rate=24000&quali
 | `response_format` | `json` | `json` or `text` |
 
 ```bash
-curl https://api.<your-domain>/v1/stt -H "Authorization: Bearer $KEY" -F file=@question.m4a
+curl https://api.dhvni.in/v1/stt -H "Authorization: Bearer $KEY" -F file=@question.m4a
 ```
 ```json
-{"text": "सर, mitochondria को powerhouse क्यों कहते हैं?", "model": "swara-transcribe-1", "duration_seconds": 3.2, "request_id": "req_..."}
+{"text": "सर, mitochondria को powerhouse क्यों कहते हैं?", "model": "dhvni-transcribe-1", "duration_seconds": 3.2, "request_id": "req_..."}
 ```
 
 ## Usage
@@ -109,7 +111,9 @@ Errors are JSON with a `detail` message: `{"detail": "..."}`.
 | Status | When |
 |---|---|
 | 400 | bad input: unknown model, empty file, audio that can't be processed |
-| 401 | missing or wrong API key |
+| 401 | missing, wrong or revoked API key |
+| 402 | the account's credit balance is used up (only when prepaid credit is enforced) |
+| 403 | the account is waiting for approval or suspended |
 | 404 | the voice isn't on your account |
 | 413 | text longer than 5,000 characters, or a file larger than 25 MB |
 | 429 | too many requests (120 a minute) or too many at once (4 text-to-speech, 8 speech-to-text). Retry after the `Retry-After` header's seconds |

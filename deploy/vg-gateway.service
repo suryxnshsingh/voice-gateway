@@ -1,0 +1,16 @@
+[Unit]
+Description=Dhvni API gateway (TTS/STT)
+After=network-online.target vg-worker.service
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/voice-gateway/gateway
+EnvironmentFile=/etc/voice-gateway/gateway.env
+ExecStart=/home/ubuntu/voice-gateway/gateway/.venv/bin/voicegw serve
+Restart=always
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

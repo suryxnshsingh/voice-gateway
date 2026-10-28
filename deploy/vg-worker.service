@@ -1,0 +1,16 @@
+[Unit]
+Description=Dhvni voice worker (GPU TTS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/voice-gateway/worker
+EnvironmentFile=/etc/voice-gateway/worker.env
+ExecStart=/home/ubuntu/voice-gateway/worker/.venv/bin/vgworker
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

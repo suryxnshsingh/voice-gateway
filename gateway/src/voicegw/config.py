@@ -7,9 +7,17 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="VG_", env_file=".env", extra="ignore")
 
     # Public API branding. Customers only ever see these names, never the engines behind them.
-    brand: str = "Swara"
-    brand_tts_model: str = "swara-voice-1"
-    brand_stt_model: str = "swara-transcribe-1"
+    brand: str = "Dhvni"
+    brand_tts_model: str = "dhvni-voice-1"
+    brand_stt_model: str = "dhvni-transcribe-1"
+    # Accounts, API keys, voices and the usage log from the Dhvni dashboard's Supabase project
+    # (secret key, which skips row level security). Empty: the gateway's own SQLite (dev and tests).
+    supabase_url: str = ""
+    supabase_secret_key: str = ""
+    # Seconds to reuse an answer from Supabase: a revoked key or a new voice takes up to this long.
+    accounts_cache_s: float = 30
+    # Refuse TTS and STT with 402 once an account's prepaid credit balance is used up.
+    require_credit: bool = False
     # v1: operators clone voices for customers (voicegw import-voice); customers only list them.
     self_serve_voices: bool = False
     # The internal test page and the voice-agent WebSocket. Turn off on the public deployment.

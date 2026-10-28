@@ -9,6 +9,9 @@ upstream error text never leave this module: failures map to neutral messages, d
     WS   /v1/tts/stream        text in as it's written (e.g. from an LLM), PCM16 audio out
     POST /v1/stt               audio file -> transcript
     POST /v1/tokens            short-lived token for browsers to open the WebSocket
+
+Keys, accounts and voices come from app.state.accounts (accounts.py). Every TTS/STT request that
+gets past authentication leaves one row in the request log (Meter), whatever its outcome.
 """
 
 import asyncio
@@ -26,7 +29,7 @@ from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
 
 from .audio import FORMATS, AudioError, StreamEncoder, encode, ffmpeg_convert, pcm_seconds
-from .auth import CurrentCustomer, bearer, mint_session_token, read_session_token
+from .auth import CurrentCustomer, bearer, mint_session_token, read_session_claims
 from .config import settings
 from .db import Customer
 from .providers.transcribe import TranscribeError
@@ -49,14 +52,54 @@ def _chunks(text: str) -> list[str]:
     return [c for c in sp.feed(text.strip() + " ") + sp.flush() if c]
 
 
-def _record(request_app, customer: Customer, rid: str, rows: list[tuple[str, float, str]]) -> None:
-    request_app.state.db.add_usage([(customer.id, rid, kind, qty, provider, None) for kind, qty, provider in rows])
+class Meter:
+    """One request's row in the request log, written once when the request ends."""
+
+    def __init__(self, app, customer: Customer, endpoint: str, rid: str, voice_id: str | None = None):
+        self.app, self.customer, self.endpoint, self.rid, self.voice_id = app, customer, endpoint, rid, voice_id
+        self.started = time.monotonic()
+        self.characters = 0
+        self.audio_seconds = 0.0
+        self.latency_ms: int | None = None
+        self._written = False
+
+    def first_audio(self) -> None:
+        if self.latency_ms is None:
+            self.latency_ms = round((time.monotonic() - self.started) * 1000)
+
+    def done(self, status: int = 200) -> None:
+        if self._written:
+            return
+        self._written = True
+        accounts = self.app.state.accounts
+        self.app.state.db.add_request({
+            "request_id": self.rid, "customer_id": self.customer.id, "api_key_id": self.customer.key_id,
+            "endpoint": self.endpoint, "voice_id": self.voice_id, "characters": self.characters,
+            "audio_seconds": self.audio_seconds, "status_code": status, "latency_ms": self.latency_ms,
+            "created_at": time.time(),
+        }, "pending" if accounts.remote else "none")
+
+    def failed(self, e: HTTPException) -> HTTPException:
+        """Logs the failure and returns it with X-Request-Id, for `raise meter.failed(e)`."""
+        self.done(e.status_code)
+        return HTTPException(e.status_code, e.detail, headers={**(e.headers or {}), "X-Request-Id": self.rid})
+
+
+async def _check_credit(app, customer: Customer) -> None:
+    if not settings.require_credit:
+        return
+    balance = await app.state.accounts.balance_paise(customer)
+    if balance is not None and balance <= 0:
+        raise HTTPException(402, "Your credit balance has run out. Add credits from the dashboard to continue.")
 
 
 async def _voice_for(app, customer: Customer, voice_id: str) -> dict:
-    v = app.state.db.voice_for(customer.id, voice_id)
-    if v is None or v["status"] != "active":
+    v = await app.state.accounts.voice(customer, voice_id)
+    if v is None:
         raise HTTPException(404, f"Voice {voice_id} not found on this account.")
+    if not (settings.voices_dir / voice_id / "reference.wav").exists():
+        log.error("voice %s is live for %s but this gateway has no reference audio for it", voice_id, customer.id)
+        raise HTTPException(503, "This voice is not available right now. Please retry later.")
     worker = app.state.worker
     try:
         if not await worker.has_voice(voice_id):
@@ -115,59 +158,65 @@ class TTSRequest(BaseModel):
 @router.post("/v1/tts", tags=["text-to-speech"], summary="Text to speech",
              responses={200: {"content": {"audio/mpeg": {}, "audio/ogg": {}, "audio/wav": {}, "audio/pcm": {}}}})
 async def tts(body: TTSRequest, request: Request, customer: Customer = CurrentCustomer):
-    if body.model and body.model != settings.brand_tts_model:
-        raise HTTPException(400, f"Unknown model {body.model!r}.")
-    if len(body.text) > settings.tts_max_chars:
-        raise HTTPException(413, f"Text is longer than {settings.tts_max_chars} characters.")
     app, rid = request.app, _rid()
-    await _voice_for(app, customer, body.voice_id)
-    pieces = _chunks(body.text)
-    if not pieces:
-        raise HTTPException(400, "Nothing to speak in that text.")
+    meter = Meter(app, customer, "tts", rid, body.voice_id)
+    meter.characters = len(body.text)
+    try:
+        if body.model and body.model != settings.brand_tts_model:
+            raise HTTPException(400, f"Unknown model {body.model!r}.")
+        if len(body.text) > settings.tts_max_chars:
+            raise HTTPException(413, f"Text is longer than {settings.tts_max_chars} characters.")
+        await _voice_for(app, customer, body.voice_id)
+        pieces = _chunks(body.text)
+        if not pieces:
+            raise HTTPException(400, "Nothing to speak in that text.")
+        await _check_credit(app, customer)
+        slot = app.state.limiter.acquire(customer.id, "tts")
+    except HTTPException as e:
+        raise meter.failed(e) from None
     steps, sr, fmt = QUALITY_STEPS[body.quality], body.sample_rate, body.format
     media_type = FORMATS[fmt][1]
     headers = {"X-Request-Id": rid}
-    slot = app.state.limiter.acquire(customer.id, "tts")
 
-    def bill(pcm_bytes: int) -> None:
-        _record(app, customer, rid, [("tts_characters", len(body.text), "tts"),
-                                     ("tts_seconds", pcm_bytes / (2 * sr), "tts")])
+    async def render(piece: str):
+        async for c in _render(app, body.voice_id, piece, sr, steps):
+            meter.first_audio()
+            meter.audio_seconds += len(c) / (2 * sr)
+            yield c
 
     if not body.stream:
         try:
             pcm = bytearray()
             for piece in pieces:
-                async for c in _render(app, body.voice_id, piece, sr, steps):
+                async for c in render(piece):
                     pcm += c
             audio = await encode(bytes(pcm), sr, fmt)
         except (WorkerError, AudioError, OSError) as e:
-            raise _engine_error(e) from e
+            raise meter.failed(_engine_error(e)) from e
         finally:
             app.state.limiter.release(slot)
-        bill(len(pcm))
+        meter.done()
         headers["X-Audio-Seconds"] = f"{len(pcm) / (2 * sr):.2f}"
         return Response(audio, media_type=media_type, headers=headers)
 
     async def stream():
-        total = 0
+        status = 499  # the client went away before the end; failed and abandoned streams cost nothing
         try:
             if fmt in ("pcm", "wav"):
                 if fmt == "wav":  # streaming WAV: sizes unknown up front, so the max value (players accept it)
                     yield _wav_header_unknown_size(sr)
                 for piece in pieces:
-                    async for c in _render(app, body.voice_id, piece, sr, steps):
-                        total += len(c)
+                    async for c in render(piece):
                         yield c
+                status = 200
                 return
             enc = StreamEncoder(sr, fmt)
             await enc.start()
 
             async def feed():
-                nonlocal total
                 try:
                     for piece in pieces:
-                        async for c in _render(app, body.voice_id, piece, sr, steps):
-                            total += len(c)
+                        async for c in render(piece):
                             await enc.write(c)
                 finally:
                     with contextlib.suppress(Exception):
@@ -178,14 +227,16 @@ async def tts(body: TTSRequest, request: Request, customer: Customer = CurrentCu
                 while data := await enc.read():
                     yield data
                 await feeder
+                status = 200
             finally:
                 feeder.cancel()
                 enc.kill()
         except (WorkerError, AudioError, OSError) as e:
+            status = 500
             log.error("tts stream %s ended early: %r", rid, e)  # headers are sent; the stream just ends
         finally:
             app.state.limiter.release(slot)
-            bill(total)
+            meter.done(status)
 
     return StreamingResponse(stream(), media_type=media_type, headers=headers)
 
@@ -198,7 +249,7 @@ def _wav_header_unknown_size(sr: int) -> bytes:
 
 @router.post("/v1/tokens", tags=["auth"], summary="Short-lived token for browser WebSockets")
 async def token(customer: Customer = CurrentCustomer):
-    tok, exp = mint_session_token(customer.id)
+    tok, exp = mint_session_token(customer.id, key_id=customer.key_id)
     return {"token": tok, "expires_at": exp}
 
 
@@ -208,28 +259,42 @@ async def tts_stream(ws: WebSocket, voice_id: str = Query(...), sample_rate: int
     """Streaming TTS. Send {"type":"text","text":...} as text arrives, {"type":"flush"} to speak what's
     buffered, {"type":"cancel"} to stop, {"type":"close"} to finish and close. Audio comes back as
     binary PCM16 frames; {"type":"chunk.done", ...} after each piece and {"type":"done"} at the end."""
-    db = ws.app.state.db
+    async def refuse(code: int, reason: str) -> None:
+        # Accept first: a close before the handshake completes reaches the client as a bare HTTP 403.
+        await ws.accept()
+        await ws.close(code=code, reason=reason[:120])
+
+    accounts = ws.app.state.accounts
     key = bearer(ws.headers.get("authorization"))
-    customer = db.customer_for_key(key) if key else (db.customer(read_session_token(token) or "") if token else None)
+    claims = read_session_claims(token) if token and not key else None
+    try:
+        customer = await accounts.for_key(key) if key else (await accounts.for_token(claims) if claims else None)
+    except HTTPException as e:  # account not active, or accounts unreachable
+        await refuse(4403 if e.status_code == 403 else 1013, str(e.detail))
+        return
     if customer is None:
-        await ws.close(code=4401, reason="unauthorized")
+        await refuse(4401, "unauthorized")
         return
     if sample_rate not in (16000, 22050, 24000, 44100, 48000) or quality not in QUALITY_STEPS:
-        await ws.close(code=4400, reason="bad sample_rate or quality")
+        await refuse(4400, "bad sample_rate or quality")
         return
     await ws.accept()
     app, rid = ws.app, _rid()
+    meter = Meter(app, customer, "tts_stream", rid, voice_id)
     try:
         await _voice_for(app, customer, voice_id)
+        await _check_credit(app, customer)
         slot = app.state.limiter.acquire(customer.id, "tts")
     except HTTPException as e:
+        meter.done(e.status_code)
         await ws.send_json({"type": "error", "status": e.status_code, "message": e.detail})
         await ws.close()
         return
     steps = QUALITY_STEPS[quality]
     splitter = SentenceSplitter()
     queue: asyncio.Queue[str | None] = asyncio.Queue()
-    chars = audio_bytes = 0
+    audio_bytes = 0
+    status = 200
     send_lock = asyncio.Lock()
 
     async def send_json(obj):
@@ -237,16 +302,28 @@ async def tts_stream(ws: WebSocket, voice_id: str = Query(...), sample_rate: int
             await ws.send_json(obj)
 
     async def renderer():
-        nonlocal audio_bytes
-        while (piece := await queue.get()) is not None:
-            n = 0
-            async for c in _render(app, voice_id, piece, sample_rate, steps):
-                n += len(c)
-                async with send_lock:
-                    await ws.send_bytes(c)
-            audio_bytes += n
-            await send_json({"type": "chunk.done", "text": piece, "audio_ms": round(n / (2 * sample_rate) * 1000)})
-        await send_json({"type": "done", "characters": chars, "audio_ms": round(audio_bytes / (2 * sample_rate) * 1000)})
+        # Billed per piece spoken, so text dropped by a cancel costs nothing.
+        nonlocal audio_bytes, status
+        try:
+            while (piece := await queue.get()) is not None:
+                n = 0
+                async for c in _render(app, voice_id, piece, sample_rate, steps):
+                    meter.first_audio()
+                    n += len(c)
+                    async with send_lock:
+                        await ws.send_bytes(c)
+                audio_bytes += n
+                meter.characters += len(piece)
+                meter.audio_seconds = audio_bytes / (2 * sample_rate)
+                await send_json({"type": "chunk.done", "text": piece, "audio_ms": round(n / (2 * sample_rate) * 1000)})
+            await send_json({"type": "done", "characters": meter.characters,
+                             "audio_ms": round(audio_bytes / (2 * sample_rate) * 1000)})
+        except Exception as e:  # anything, so the client hears about it instead of waiting forever
+            status = 500
+            log.error("tts ws %s failed: %r", rid, e, exc_info=not isinstance(e, (WorkerError, AudioError, OSError)))
+            with contextlib.suppress(Exception):
+                await send_json({"type": "error", "message": "Speech generation failed."})
+                await ws.close(code=1011)
 
     task = asyncio.create_task(renderer())
     await send_json({"type": "ready", "request_id": rid, "model": settings.brand_tts_model, "sample_rate": sample_rate})
@@ -263,7 +340,8 @@ async def tts_stream(ws: WebSocket, voice_id: str = Query(...), sample_rate: int
             kind = ev.get("type")
             if kind == "text":
                 text = str(ev.get("text", ""))
-                chars += len(text)
+                if meter.latency_ms is None and not text.isspace():
+                    meter.started = time.monotonic()  # latency: from the text that is waiting to be spoken
                 for piece in splitter.feed(text):
                     queue.put_nowait(piece)
             elif kind == "flush":
@@ -290,14 +368,14 @@ async def tts_stream(ws: WebSocket, voice_id: str = Query(...), sample_rate: int
     except WebSocketDisconnect:
         pass
     except (WorkerError, AudioError, OSError) as e:
+        status = 500
         log.error("tts ws %s failed: %r", rid, e)
         with contextlib.suppress(Exception):
             await send_json({"type": "error", "message": "Speech generation failed."})
     finally:
         task.cancel()
         app.state.limiter.release(slot)
-        _record(app, customer, rid, [("tts_characters", chars, "tts"),
-                                     ("tts_seconds", audio_bytes / (2 * sample_rate), "tts")])
+        meter.done(status)
         with contextlib.suppress(Exception):
             await ws.close()
 
@@ -310,28 +388,35 @@ async def stt(request: Request, file: UploadFile = File(..., description="mp3, m
               prompt: str | None = Form(None, description="Context or terms to expect (names, subject words)."),
               response_format: Literal["json", "text"] = Form("json"),
               customer: Customer = CurrentCustomer):
-    if model and model != settings.brand_stt_model:
-        raise HTTPException(400, f"Unknown model {model!r}.")
     app, rid = request.app, _rid()
-    data = await file.read(settings.stt_max_bytes + 1)
-    if len(data) > settings.stt_max_bytes:
-        raise HTTPException(413, "Files are limited to 25 MB.")
-    if not data:
-        raise HTTPException(400, "The file is empty.")
-    if not app.state.transcriber.available:
-        raise HTTPException(503, "Transcription is temporarily unavailable.")
-    async with app.state.limiter.slot(customer.id, "stt"):
-        started = time.monotonic()
-        try:
-            result = await app.state.transcriber.transcribe(data, file.filename or "audio.wav", language, prompt)
-        except TranscribeError as e:
-            raise HTTPException(e.status, e.message, headers={"X-Request-Id": rid}) from None
+    meter = Meter(app, customer, "stt", rid)
+    try:
+        if model and model != settings.brand_stt_model:
+            raise HTTPException(400, f"Unknown model {model!r}.")
+        data = await file.read(settings.stt_max_bytes + 1)
+        if len(data) > settings.stt_max_bytes:
+            raise HTTPException(413, "Files are limited to 25 MB.")
+        if not data:
+            raise HTTPException(400, "The file is empty.")
+        if not app.state.transcriber.available:
+            raise HTTPException(503, "Transcription is temporarily unavailable.")
+        await _check_credit(app, customer)
+        async with app.state.limiter.slot(customer.id, "stt"):
+            try:
+                result = await app.state.transcriber.transcribe(data, file.filename or "audio.wav", language, prompt)
+            except TranscribeError as e:
+                raise HTTPException(e.status, e.message) from None
+    except HTTPException as e:
+        meter.latency_ms = round((time.monotonic() - meter.started) * 1000)
+        raise meter.failed(e) from None
     seconds = result.seconds
     if seconds is None:
         with contextlib.suppress(AudioError):
             seconds = round(pcm_seconds(await ffmpeg_convert(data, 16000, "s16le"), 16000), 2)
-    _record(app, customer, rid, [("stt_seconds", seconds or 0, "stt")])
-    log.info("stt %s: %.1fs audio in %.0f ms", rid, seconds or 0, (time.monotonic() - started) * 1000)
+    meter.audio_seconds = seconds or 0
+    meter.latency_ms = round((time.monotonic() - meter.started) * 1000)
+    meter.done()
+    log.info("stt %s: %.1fs audio in %d ms", rid, seconds or 0, meter.latency_ms)
     headers = {"X-Request-Id": rid}
     if response_format == "text":
         return PlainTextResponse(result.text, headers=headers)

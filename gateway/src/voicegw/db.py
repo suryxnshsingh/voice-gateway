@@ -1,4 +1,4 @@
-"""SQLite store for customers, API keys, voices, consent records and usage.
+"""SQLite store for customers, API keys, voices, consent records, usage and the public request log.
 
 One file, stdlib only. Fine for a single gateway box; the interface is small enough to move to
 Postgres when there is more than one.
@@ -61,6 +61,23 @@ CREATE TABLE IF NOT EXISTS usage_events (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS usage_by_customer ON usage_events(customer_id, created_at);
+-- One row per public API request (TTS, streaming TTS, STT), successful or not. With Supabase
+-- accounts, accounts.UsageSync copies pending rows to the dashboard's usage_events.
+CREATE TABLE IF NOT EXISTS requests (
+    request_id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    api_key_id INTEGER,
+    endpoint TEXT NOT NULL,                      -- tts | tts_stream | stt
+    voice_id TEXT,
+    characters INTEGER NOT NULL,
+    audio_seconds REAL NOT NULL,
+    status_code INTEGER NOT NULL,
+    latency_ms INTEGER,                          -- TTS: to the first audio; STT: the whole request
+    created_at REAL NOT NULL,
+    sync TEXT NOT NULL                           -- none (local accounts) | pending | sent | failed: <why>
+);
+CREATE INDEX IF NOT EXISTS requests_by_customer ON requests(customer_id, created_at);
+CREATE INDEX IF NOT EXISTS requests_pending ON requests(created_at) WHERE sync = 'pending';
 """
 
 # Columns added after the first release; applied to existing databases on startup.
@@ -82,6 +99,7 @@ def _hash_key(key: str) -> str:
 class Customer:
     id: str
     name: str
+    key_id: int | None = None   # the Supabase api_keys row the request came in with
 
 
 class DB:
@@ -216,3 +234,36 @@ class DB:
             "GROUP BY kind, provider, model ORDER BY kind",
             (customer_id, since, until),
         )
+
+    # public request log
+
+    def add_request(self, row: dict, sync: str) -> None:
+        self._exec(
+            "INSERT OR IGNORE INTO requests (request_id, customer_id, api_key_id, endpoint, voice_id, characters, "
+            "audio_seconds, status_code, latency_ms, created_at, sync) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (row["request_id"], row["customer_id"], row["api_key_id"], row["endpoint"], row["voice_id"],
+             row["characters"], row["audio_seconds"], row["status_code"], row["latency_ms"], row["created_at"], sync),
+        )
+
+    def pending_requests(self, limit: int) -> list[dict]:
+        return self._all("SELECT * FROM requests WHERE sync = 'pending' ORDER BY created_at LIMIT ?", (limit,))
+
+    def mark_requests(self, request_ids: list[str], sync: str) -> None:
+        with self._lock:
+            self._conn.executemany("UPDATE requests SET sync = ? WHERE request_id = ?", [(sync, r) for r in request_ids])
+
+    def request_counts(self) -> dict[str, int]:
+        rows = self._all("SELECT CASE WHEN sync LIKE 'failed%' THEN 'failed' ELSE sync END AS s, COUNT(*) AS n "
+                         "FROM requests GROUP BY s")
+        return {r["s"]: r["n"] for r in rows}
+
+    def request_totals(self, customer_id: str, since: float, until: float) -> dict[str, float]:
+        """Billable totals: successful requests only, as the dashboard prices them."""
+        row = self._one(
+            "SELECT COALESCE(SUM(CASE WHEN endpoint != 'stt' THEN characters END), 0) AS tts_characters, "
+            "COALESCE(SUM(CASE WHEN endpoint != 'stt' THEN audio_seconds END), 0) AS tts_seconds, "
+            "COALESCE(SUM(CASE WHEN endpoint = 'stt' THEN audio_seconds END), 0) AS stt_seconds "
+            "FROM requests WHERE customer_id = ? AND created_at >= ? AND created_at < ? AND status_code < 400",
+            (customer_id, since, until),
+        )
+        return {k: float(v) for k, v in row.items()}
