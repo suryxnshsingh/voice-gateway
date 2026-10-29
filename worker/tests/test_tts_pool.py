@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 import torch
 
-from vgworker.tts import StreamStats, TTSBusy, TTSPool
+from vgworker.tts import AdapterNotFound, StreamStats, TTSBusy, TTSPool
 
 
 class FakeModel:
@@ -39,6 +39,7 @@ def make_pool(tmp_path, n=1) -> TTSPool:
     pool._caches, pool._cache_size, pool._loading = OrderedDict(), 8, {}
     pool.last_used = time.monotonic()
     pool._caches["v"] = {"mode": "reference"}
+    pool._init_adapters(tmp_path / "adapters", False, 4)
     return pool
 
 
@@ -97,3 +98,73 @@ async def test_keep_warm_only_when_idle_and_returns_the_instance(tmp_path):
     held = await pool._acquire("someone", timeout=1)
     assert await pool.keep_warm() is False  # never competes with a real request
     pool._release(held, pool._holders[id(held)])
+
+
+class LoraModel(FakeModel):
+    """Two LoRA tensors, the way a compiled VoxCPM2 names them."""
+
+    def __init__(self):
+        self.params = {"lm._orig_mod.q_proj.lora_A": torch.nn.Parameter(torch.ones(2, 2)),
+                       "lm._orig_mod.q_proj.lora_B": torch.nn.Parameter(torch.ones(2, 2))}
+        self.resets = 0
+
+    def named_parameters(self):
+        return iter(self.params.items())
+
+    def reset_lora_weights(self):
+        self.resets += 1
+        self.params["lm._orig_mod.q_proj.lora_B"].data.zero_()
+
+
+def adapter_pool(tmp_path):
+    from safetensors.torch import save_file
+
+    pool = make_pool(tmp_path)
+    pool._models = [LoraModel()]
+    pool._idle = asyncio.Queue()
+    pool._idle.put_nowait(pool._models[0])
+    pool._init_adapters(tmp_path / "adapters", True, 4)
+    (tmp_path / "adapters" / "teacher").mkdir(parents=True)
+    save_file({"lm.q_proj.lora_A": torch.full((2, 2), 3.0), "lm.q_proj.lora_B": torch.full((2, 2), 5.0)},
+              str(tmp_path / "adapters" / "teacher" / "lora_weights.safetensors"))
+    return pool
+
+
+async def say(pool, adapter=None):
+    async with contextlib.aclosing(pool.stream("v", "hi", 24000, StreamStats(), adapter=adapter)) as chunks:
+        return len([c async for c in chunks])
+
+
+async def test_a_fine_tuned_voice_gets_its_adapter_and_others_get_the_base(tmp_path):
+    pool = adapter_pool(tmp_path)
+    model = pool._models[0]
+    b = model.params["lm._orig_mod.q_proj.lora_B"]
+    assert await say(pool, "teacher") >= 5
+    assert float(b.data[0, 0]) == 5.0 and pool.adapters_loaded == 1
+    await say(pool)  # a cloned voice: LoRA zeroed, so exactly the base model
+    assert float(b.data.abs().sum()) == 0.0
+    resets = model.resets
+    await say(pool)
+    assert model.resets == resets  # already on the base: nothing to copy
+    await say(pool, "teacher")
+    assert float(b.data[0, 0]) == 5.0 and await settle(pool, 1) == 1
+
+
+async def test_a_missing_adapter_fails_fast_and_frees_nothing(tmp_path):
+    pool = adapter_pool(tmp_path)
+    with pytest.raises(AdapterNotFound):
+        await say(pool, "nobody")
+    assert pool.idle == 1 and pool.busy() == []
+
+
+async def test_an_adapter_that_does_not_fit_is_refused(tmp_path):
+    from safetensors.torch import save_file
+
+    pool = adapter_pool(tmp_path)
+    (tmp_path / "adapters" / "other").mkdir()
+    save_file({"dit.k_proj.lora_A": torch.ones(2, 2)}, str(tmp_path / "adapters" / "other" / "lora_weights.safetensors"))
+    with pytest.raises(AdapterNotFound):
+        await say(pool, "other")
+    assert await settle(pool, 1) == 1
+    await say(pool)  # the half switched instance is reset before the next voice
+    assert float(pool._models[0].params["lm._orig_mod.q_proj.lora_B"].data.abs().sum()) == 0.0

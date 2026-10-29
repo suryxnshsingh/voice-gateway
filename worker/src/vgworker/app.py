@@ -15,11 +15,12 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket
 
 from .audio import decode, pcm16_to_float, write_wav
 from .config import settings
-from .tts import StreamStats, TTSBusy, TTSPool, VoiceNotFound
+from .tts import AdapterNotFound, StreamStats, TTSBusy, TTSPool, VoiceNotFound
 
 log = logging.getLogger("vgworker")
 
 _VOICE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_ADAPTER = re.compile(r"^[a-z0-9_]{1,64}$")
 _SAMPLE_RATES = {8000, 16000, 22050, 24000, 44100, 48000}
 
 
@@ -37,6 +38,7 @@ state = State()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.voices_dir.mkdir(parents=True, exist_ok=True)
+    settings.adapters_dir.mkdir(parents=True, exist_ok=True)
     loop = asyncio.get_running_loop()
     if "tone" in settings.load:
         from .tone import ToneModel
@@ -58,6 +60,10 @@ async def lifespan(app: FastAPI):
             settings.voices_dir,
             settings.tts_cfg,
             settings.tts_timesteps,
+            adapters_dir=settings.adapters_dir,
+            lora_r=settings.lora_r,
+            lora_alpha=settings.lora_alpha,
+            adapter_cache=settings.adapter_cache,
         )
         await state.tts.warmup()
         log.info("tts warm")
@@ -113,7 +119,8 @@ async def health():
         "tts": None
         if tts is None
         else {"model": settings.tts_model, "instances": tts.instances, "idle": tts.idle, "busy": tts.busy(), "device": tts.device,
-              "sample_rate": tts.sample_rate, "cached_voices": tts.cached_voices},
+              "sample_rate": tts.sample_rate, "cached_voices": tts.cached_voices,
+              "lora": tts._lora, "adapters_loaded": tts.adapters_loaded},
         "tone": state.tone is not None,
         "speaker": state.speaker is not None,
     }
@@ -155,6 +162,17 @@ async def delete_voice(voice_id: str):
     tts.evict(voice_id)
     tts.voice_path(voice_id).unlink(missing_ok=True)
     return {"deleted": voice_id}
+
+
+@app.get("/adapters/{name}")
+async def get_adapter(name: str):
+    """Whether this worker can serve a fine-tuned voice's adapter (`voicegw check` asks)."""
+    if not _ADAPTER.match(name):
+        raise HTTPException(400, "bad adapter name")
+    tts = _need(state.tts, "tts")
+    if not tts._lora or tts.adapter_file(name) is None:
+        raise HTTPException(404, "adapter not on this worker")
+    return {"adapter": name}
 
 
 @app.post("/tone")
@@ -206,12 +224,14 @@ async def tts_stream(ws: WebSocket):
         # Optional quality knobs: fewer diffusion steps is faster; bounded so a caller can't stall the GPU.
         timesteps = int(req["inference_timesteps"]) if req.get("inference_timesteps") else None
         cfg_value = float(req["cfg_value"]) if req.get("cfg_value") else None
+        adapter = str(req["adapter"]) if req.get("adapter") else None
     except (KeyError, ValueError, TypeError):
         await ws.send_json({"type": "error", "code": "bad_request"})
         await ws.close()
         return
     if (not _VOICE_ID.match(voice_id) or not text or len(text) > settings.tts_max_chars or out_sr not in _SAMPLE_RATES
-            or (timesteps is not None and not 2 <= timesteps <= 30) or (cfg_value is not None and not 0.5 <= cfg_value <= 5)):
+            or (timesteps is not None and not 2 <= timesteps <= 30) or (cfg_value is not None and not 0.5 <= cfg_value <= 5)
+            or (adapter is not None and not _ADAPTER.match(adapter))):
         await ws.send_json({"type": "error", "code": "bad_request"})
         await ws.close()
         return
@@ -230,7 +250,8 @@ async def tts_stream(ws: WebSocket):
     watcher = asyncio.create_task(watch_cancel())
     stats = StreamStats()
     try:
-        async with contextlib.aclosing(tts.stream(voice_id, text, out_sr, stats, timesteps=timesteps, cfg_value=cfg_value)) as chunks:
+        async with contextlib.aclosing(tts.stream(voice_id, text, out_sr, stats, timesteps=timesteps, cfg_value=cfg_value,
+                                                  adapter=adapter)) as chunks:
             async for chunk in chunks:
                 if cancelled.is_set():
                     break
@@ -250,6 +271,10 @@ async def tts_stream(ws: WebSocket):
     except VoiceNotFound:
         with contextlib.suppress(Exception):
             await ws.send_json({"type": "error", "code": "voice_not_found"})
+    except AdapterNotFound as e:
+        log.error("adapter missing for %s: %s", voice_id, e)
+        with contextlib.suppress(Exception):
+            await ws.send_json({"type": "error", "code": "adapter_not_found"})
     except TTSBusy as e:
         log.error("%s", e)
         with contextlib.suppress(Exception):

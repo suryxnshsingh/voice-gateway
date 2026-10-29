@@ -110,12 +110,12 @@ async def _voice_for(app, customer: Customer, voice_id: str) -> dict:
     return v
 
 
-async def _render(app, voice_id: str, text: str, sr: int, steps: int):
+async def _render(app, voice_id: str, text: str, sr: int, steps: int, adapter: str | None = None):
     """PCM16 chunks for one piece of text. Retries once if the engine lost the voice."""
     for attempt in range(2):
         result = TtsResult()
         try:
-            async with contextlib.aclosing(app.state.worker.tts(voice_id, text, sr, result, steps)) as chunks:
+            async with contextlib.aclosing(app.state.worker.tts(voice_id, text, sr, result, steps, adapter)) as chunks:
                 async for c in chunks:
                     yield c
             return
@@ -129,6 +129,10 @@ async def _render(app, voice_id: str, text: str, sr: int, steps: int):
 def _engine_error(e: Exception) -> HTTPException:
     if isinstance(e, WorkerError) and e.code in ("tts_busy", "tts_timeout"):
         return HTTPException(503, "The voice engine is busy. Please retry shortly.", headers={"Retry-After": "2"})
+    if isinstance(e, WorkerError) and e.code == "adapter_not_found":
+        # A fine-tuned voice never quietly falls back to the base model: it would sound like someone else.
+        log.error("fine-tuned voice has no adapter on the worker", exc_info=e)
+        return HTTPException(503, "This voice is not available right now. Please retry later.")
     log.exception("tts failed", exc_info=e)
     return HTTPException(500, "Speech generation failed. Please retry.")
 
@@ -166,7 +170,7 @@ async def tts(body: TTSRequest, request: Request, customer: Customer = CurrentCu
             raise HTTPException(400, f"Unknown model {body.model!r}.")
         if len(body.text) > settings.tts_max_chars:
             raise HTTPException(413, f"Text is longer than {settings.tts_max_chars} characters.")
-        await _voice_for(app, customer, body.voice_id)
+        voice = await _voice_for(app, customer, body.voice_id)
         pieces = _chunks(body.text)
         if not pieces:
             raise HTTPException(400, "Nothing to speak in that text.")
@@ -179,7 +183,7 @@ async def tts(body: TTSRequest, request: Request, customer: Customer = CurrentCu
     headers = {"X-Request-Id": rid}
 
     async def render(piece: str):
-        async for c in _render(app, body.voice_id, piece, sr, steps):
+        async for c in _render(app, body.voice_id, piece, sr, steps, voice.get("adapter")):
             meter.first_audio()
             meter.audio_seconds += len(c) / (2 * sr)
             yield c
@@ -282,7 +286,7 @@ async def tts_stream(ws: WebSocket, voice_id: str = Query(...), sample_rate: int
     app, rid = ws.app, _rid()
     meter = Meter(app, customer, "tts_stream", rid, voice_id)
     try:
-        await _voice_for(app, customer, voice_id)
+        voice = await _voice_for(app, customer, voice_id)
         await _check_credit(app, customer)
         slot = app.state.limiter.acquire(customer.id, "tts")
     except HTTPException as e:
@@ -307,7 +311,7 @@ async def tts_stream(ws: WebSocket, voice_id: str = Query(...), sample_rate: int
         try:
             while (piece := await queue.get()) is not None:
                 n = 0
-                async for c in _render(app, voice_id, piece, sample_rate, steps):
+                async for c in _render(app, voice_id, piece, sample_rate, steps, voice.get("adapter")):
                     meter.first_audio()
                     n += len(c)
                     async with send_lock:

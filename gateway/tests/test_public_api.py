@@ -27,8 +27,9 @@ class FakeWorker:
     async def health(self):
         return {"tts": {"model": "internal-model-path"}}
 
-    async def tts(self, voice_id, text, sr, result, timesteps=None):
+    async def tts(self, voice_id, text, sr, result, timesteps=None, adapter=None):
         self.calls.append((text, sr, timesteps))
+        self.adapters = getattr(self, "adapters", []) + [adapter]
         for _ in range(3):
             yield b"\x10\x00" * (sr // 50)  # 20 ms
         result.status = "done"

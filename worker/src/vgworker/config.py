@@ -20,6 +20,14 @@ class Settings:
     # intelligibility (bench/tts_sweep.py on an M5 Pro, Oct 2026). 4 audibly degrades.
     tts_timesteps: int = field(default_factory=lambda: int(_env("TTS_TIMESTEPS", "8")))
     tts_max_chars: int = field(default_factory=lambda: int(_env("TTS_MAX_CHARS", "600")))
+    # Fine-tuned voices are LoRA adapters on the one base model, switched per sentence: about 70 MB
+    # of RAM each, where a merged fine-tune is a whole model on the GPU. Every adapter must be
+    # trained with this rank and alpha on the LM and DiT attention (training/conf: r 32, alpha 32).
+    # LORA_R=0 builds the model without LoRA layers, for serving a merged checkpoint as before.
+    lora_r: int = field(default_factory=lambda: int(_env("LORA_R", "32")))
+    lora_alpha: int = field(default_factory=lambda: int(_env("LORA_ALPHA", "32")))
+    # How many adapters stay in RAM; the rest load from disk (about 0.1 s) when next used.
+    adapter_cache: int = field(default_factory=lambda: int(_env("ADAPTER_CACHE", "16")))
     # Seconds of idleness after which the worker renders a tiny word to keep the model in memory.
     # 0 = off (GPU servers). On a Mac under memory pressure, ~45 avoids 10-30 s first-request stalls.
     keep_warm_s: int = field(default_factory=lambda: int(_env("KEEP_WARM_S", "0")))
@@ -40,6 +48,11 @@ class Settings:
     @property
     def voices_dir(self) -> Path:
         return self.data_dir / "voices"
+
+    @property
+    def adapters_dir(self) -> Path:
+        """One folder per adapter, holding the lora_weights.safetensors training writes."""
+        return self.data_dir / "adapters"
 
 
 settings = Settings()

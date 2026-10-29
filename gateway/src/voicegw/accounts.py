@@ -43,9 +43,15 @@ def public_voice(v: dict) -> dict:
         "status": v["status"],
         "shared": v["customer_id"] is None,
         "reference_seconds": v["reference_seconds"],
+        "fine_tuned": False,
         "created_at": v["created_at"],
         "activated_at": v["activated_at"],
     }
+
+
+def without_adapter(v: dict) -> dict:
+    """What the API shows of a voice: whether it is fine tuned, never which adapter it runs on."""
+    return {k: x for k, x in v.items() if k != "adapter"}
 
 
 def _unix(ts: str | None) -> float | None:
@@ -213,7 +219,7 @@ class SupabaseAccounts:
     async def voices(self, customer: Customer) -> list[dict]:
         async def fetch():
             return await self._call("GET", "/voices", params={
-                "select": "id,user_id,name,speaker_name,status,reference_seconds,created_at,activated_at",
+                "select": "id,user_id,name,speaker_name,status,reference_seconds,adapter,created_at,activated_at",
                 "status": "eq.active", "or": f"(user_id.eq.{customer.id},user_id.is.null)",
                 "order": "created_at.desc"})
 
@@ -221,6 +227,7 @@ class SupabaseAccounts:
         return [{
             "id": v["id"], "name": v["name"], "speaker_name": v["speaker_name"], "status": v["status"],
             "shared": v["user_id"] is None, "reference_seconds": float(v["reference_seconds"]),
+            "fine_tuned": bool(v.get("adapter")), "adapter": v.get("adapter"),
             "created_at": _unix(v["created_at"]), "activated_at": _unix(v["activated_at"]),
         } for v in rows]
 

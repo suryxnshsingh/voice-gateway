@@ -68,12 +68,15 @@ class WorkerClient:
         return r.json()["score"]
 
     async def tts(self, voice_id: str, text: str, sample_rate: int, result: TtsResult,
-                  timesteps: int | None = None) -> AsyncIterator[bytes]:
-        """Stream PCM16 for one sentence. Closing the iterator early cancels generation on the worker."""
+                  timesteps: int | None = None, adapter: str | None = None) -> AsyncIterator[bytes]:
+        """Stream PCM16 for one sentence. Closing the iterator early cancels generation on the worker.
+        `adapter` is the LoRA adapter of a fine-tuned voice; without it the voice renders on the base model."""
         async with websockets.connect(f"{self._ws_base}/tts", additional_headers=self._headers, max_size=2**22) as ws:
             req = {"voice_id": voice_id, "text": text, "sample_rate": sample_rate}
             if timesteps:
                 req["inference_timesteps"] = timesteps
+            if adapter:
+                req["adapter"] = adapter
             await ws.send(json.dumps(req))
             try:
                 first = True

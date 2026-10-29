@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 
 from . import consent
-from .accounts import LocalAccounts, SupabaseAccounts, UsageSync, public_voice
+from .accounts import LocalAccounts, SupabaseAccounts, UsageSync, public_voice, without_adapter
 from .audio import AudioError, ffmpeg_convert, pcm_seconds
 from .auth import CurrentCustomer, LocalCustomer, bearer, mint_session_token, read_session_token
 from .config import settings
@@ -180,7 +180,7 @@ async def realtime(ws: WebSocket, token: str | None = Query(None)):
 
 @app.get("/v1/voices", tags=["voices"], summary="List your voices")
 async def list_voices(request: Request, customer: Customer = CurrentCustomer):
-    return {"voices": await request.app.state.accounts.voices(customer)}
+    return {"voices": [without_adapter(v) for v in await request.app.state.accounts.voices(customer)]}
 
 
 @app.get("/v1/voices/{voice_id}", tags=["voices"], summary="Get a voice")
@@ -188,7 +188,7 @@ async def get_voice(voice_id: str, request: Request, customer: Customer = Curren
     v = await request.app.state.accounts.voice(customer, voice_id)
     if v is None:
         raise HTTPException(404, f"Voice {voice_id} not found on this account.")
-    return v
+    return without_adapter(v)
 
 
 def _self_serve_only() -> None:

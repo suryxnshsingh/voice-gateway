@@ -3,6 +3,12 @@
 Each instance owns its own KV cache, so it renders one sentence at a time. A request waits
 for an idle instance, streams 160 ms chunks from a worker thread, and hands the instance back
 when the sentence finishes or the caller stops listening.
+
+Every voice runs on the same base weights. A cloned voice is only a prompt cache (its reference
+audio, encoded). A fine-tuned voice also names a LoRA adapter, which is copied into the instance's
+LoRA layers before its sentence renders; any other voice gets the layers zeroed, which is exactly
+the base model. Values are copied in place rather than switching LoRA off, so the compiled
+graph never changes and nothing recompiles mid request.
 """
 
 import asyncio
@@ -35,6 +41,10 @@ class VoiceNotFound(Exception):
     pass
 
 
+class AdapterNotFound(Exception):
+    """The voice names an adapter this worker doesn't have, or one that doesn't fit the model."""
+
+
 class TTSBusy(Exception):
     """No instance freed up in time. Better a visible error than a reply that never speaks."""
 
@@ -57,6 +67,10 @@ class TTSPool:
         cfg_value: float,
         timesteps: int,
         cache_size: int = 256,
+        adapters_dir: Path | None = None,
+        lora_r: int = 0,
+        lora_alpha: int = 0,
+        adapter_cache: int = 16,
     ):
         import torch
         from voxcpm import VoxCPM
@@ -64,11 +78,19 @@ class TTSPool:
         dev = None if device == "auto" else device
         # torch.compile only works on CUDA; the first sentence per instance pays the compile.
         optimize = device.startswith("cuda") or (device == "auto" and torch.cuda.is_available())
+        lora = None
+        if lora_r > 0:
+            from voxcpm.model.voxcpm2 import LoRAConfig
+
+            lora = LoRAConfig(enable_lm=True, enable_dit=True, enable_proj=False, r=lora_r, alpha=lora_alpha)
         self._models = []
         for i in range(instances):
-            m = VoxCPM.from_pretrained(model_id, load_denoiser=False, optimize=optimize, device=dev)
+            m = VoxCPM.from_pretrained(model_id, load_denoiser=False, optimize=optimize, device=dev, lora_config=lora)
+            if lora is not None:
+                m.tts_model.reset_lora_weights()  # B = 0: the base model until an adapter is copied in
             self._models.append(m.tts_model)
             log.info("tts instance %d ready on %s", i, m.tts_model.device)
+        self._init_adapters(adapters_dir or voices_dir.parent / "adapters", lora is not None, adapter_cache)
         self.sample_rate: int = self._models[0].sample_rate
         self.device: str = str(self._models[0].device)
         self._idle: asyncio.Queue = asyncio.Queue()
@@ -86,6 +108,68 @@ class TTSPool:
         self._cache_size = cache_size
         self._loading: dict[str, asyncio.Task] = {}
         self.last_used = time.monotonic()
+
+    def _init_adapters(self, adapters_dir: Path, enabled: bool, cache: int) -> None:
+        self._lora = enabled
+        self._adapters_dir = adapters_dir
+        self._adapter_cache = cache
+        self._adapters: OrderedDict[str, dict] = OrderedDict()  # name -> LoRA tensors on the CPU
+        self._adapter_lock = threading.Lock()  # render threads of several instances share the cache
+        self._active: dict[int, object] = {}  # id(model) -> adapter name in its LoRA layers (None = base)
+        self._lora_params: dict[int, dict] = {}
+
+    def adapter_file(self, name: str) -> Path | None:
+        for path in (self._adapters_dir / name / "lora_weights.safetensors", self._adapters_dir / f"{name}.safetensors"):
+            if path.exists():
+                return path
+        return None
+
+    @property
+    def adapters_loaded(self) -> int:
+        return len(self._adapters)
+
+    def _adapter_state(self, name: str) -> dict:
+        with self._adapter_lock:
+            state = self._adapters.get(name)
+            if state is not None:
+                self._adapters.move_to_end(name)
+                return state
+        path = self.adapter_file(name)
+        if path is None:
+            raise AdapterNotFound(name)
+        from safetensors.torch import load_file
+
+        state = load_file(str(path), device="cpu")
+        with self._adapter_lock:
+            self._adapters[name] = state
+            while len(self._adapters) > self._adapter_cache:
+                self._adapters.popitem(last=False)
+        return state
+
+    def _use_adapter(self, model, name: str | None) -> None:
+        """Put `name`'s LoRA weights (or zeros, for None) into the instance. Runs on its render thread
+        while the instance is held, so nothing else is using it."""
+        if self._active.get(id(model)) == name:
+            return
+        if not self._lora:
+            if name is not None:
+                raise AdapterNotFound(name)
+            return
+        state = self._adapter_state(name) if name is not None else None
+        self._active[id(model)] = object()  # half switched until the copy below finishes
+        model.reset_lora_weights()
+        if state is not None:
+            params = self._lora_params.get(id(model))
+            if params is None:
+                # torch.compile wraps modules as _orig_mod; adapters are saved without it.
+                params = {k.replace("._orig_mod.", "."): p for k, p in model.named_parameters() if "lora_" in k}
+                self._lora_params[id(model)] = params
+            missing = [k for k in state if k not in params]
+            if missing:
+                raise AdapterNotFound(f"{name} does not fit this model ({len(missing)} unknown tensors, e.g. {missing[0]})")
+            for key, value in state.items():
+                params[key].data.copy_(value)
+        self._active[id(model)] = name
 
     async def keep_warm(self) -> bool:
         """Render one tiny word if every instance is idle. Under memory pressure (a Mac) an idle model gets
@@ -219,10 +303,13 @@ class TTSPool:
 
     async def stream(self, voice_id: str, text: str, out_sr: int, stats: StreamStats,
                      queue_timeout: float = 15.0, timesteps: int | None = None,
-                     cfg_value: float | None = None) -> AsyncIterator[bytes]:
-        """Yield PCM16 mono chunks at out_sr. Use with contextlib.aclosing so cancellation frees the instance."""
+                     cfg_value: float | None = None, adapter: str | None = None) -> AsyncIterator[bytes]:
+        """Yield PCM16 mono chunks at out_sr. Use with contextlib.aclosing so cancellation frees the instance.
+        `adapter` names the LoRA adapter of a fine-tuned voice; None renders on the base model."""
         t0 = time.monotonic()
         self.last_used = time.monotonic()
+        if adapter is not None and (not self._lora or self.adapter_file(adapter) is None):
+            raise AdapterNotFound(adapter)
         cache = await self._cache_for(voice_id)
         model = await self._acquire(f"tts {voice_id} {text[:30]!r}", timeout=queue_timeout)
         holder = self._holders[id(model)]
@@ -233,6 +320,12 @@ class TTSPool:
         _done = object()
 
         def run() -> None:
+            try:
+                self._use_adapter(model, adapter)
+            except Exception as e:
+                loop.call_soon_threadsafe(q.put_nowait, e)
+                loop.call_soon_threadsafe(q.put_nowait, _done)
+                return
             gen = model.generate_with_prompt_cache_streaming(
                 target_text=text, prompt_cache=cache, cfg_value=cfg_value or self._cfg,
                 inference_timesteps=timesteps or self._timesteps,

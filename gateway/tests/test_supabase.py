@@ -36,6 +36,9 @@ class FakePostgrest:
              "activated_at": "2026-10-27T11:00:00.5+00:00"},
             {"id": "voice_shared1", "user_id": None, "name": "Kavya", "speaker_name": "Kavya", "status": "active",
              "reference_seconds": "30.5", "created_at": "2026-10-26T10:00:00+00:00", "activated_at": None},
+            {"id": "voice_tuned01", "user_id": USER, "name": "Ritesh Sir, fine tuned", "speaker_name": "Ritesh",
+             "status": "active", "reference_seconds": "1320.0", "adapter": "ritesh_step250",
+             "created_at": "2026-10-28T10:00:00+00:00", "activated_at": "2026-10-28T11:00:00+00:00"},
         ]
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -88,7 +91,7 @@ def sb(tmp_path, monkeypatch):
                                     transport=httpx.MockTransport(fake))
         app.state.db, app.state.accounts = db, accounts
         app.state.worker, app.state.transcriber = FakeWorker(), FakeTranscriber()
-        for vid in ("voice_mine123", "voice_shared1"):
+        for vid in ("voice_mine123", "voice_shared1", "voice_tuned01"):
             (tmp_path / "voices" / vid).mkdir(parents=True)
             (tmp_path / "voices" / vid / "reference.wav").write_bytes(b"RIFF")
         yield client, {"Authorization": f"Bearer {KEY}"}, fake, db, UsageSync(db, accounts.http)
@@ -97,7 +100,7 @@ def sb(tmp_path, monkeypatch):
 def test_voices_come_from_supabase(sb):
     client, auth, fake, _, _ = sb
     voices = client.get("/v1/voices", headers=auth).json()["voices"]
-    assert [v["id"] for v in voices] == ["voice_mine123", "voice_shared1"]
+    assert [v["id"] for v in voices] == ["voice_mine123", "voice_shared1", "voice_tuned01"]
     assert voices[0]["shared"] is False and voices[1]["shared"] is True
     assert voices[0]["reference_seconds"] == 8.0 and voices[0]["activated_at"] == 1793098800.5
     assert client.get("/v1/voices/voice_shared1", headers=auth).status_code == 200
@@ -231,7 +234,8 @@ async def test_dashboard_session_works_like_a_key(sb):
     """The dashboard's playground calls the API with the signed in session, billed to a key it names."""
     client, _, fake, db, sync = sb
     session = {"Authorization": f"Bearer {SESSION}", "X-Api-Key-Id": "7"}
-    assert [v["id"] for v in client.get("/v1/voices", headers=session).json()["voices"]] == ["voice_mine123", "voice_shared1"]
+    assert [v["id"] for v in client.get("/v1/voices", headers=session).json()["voices"]] == [
+        "voice_mine123", "voice_shared1", "voice_tuned01"]
     r = client.post("/v1/tts", headers=session, json={"voice_id": "voice_mine123", "text": "नमस्ते बेटा।", "format": "pcm",
                                                       "stream": True})
     assert r.status_code == 200 and len(r.content) > 0
@@ -275,3 +279,17 @@ async def test_an_admin_session_without_a_key_is_free(sb, monkeypatch):
     # With a key, an admin is billed like anyone else.
     keyed = client.post("/v1/tts", headers={**admin, "X-Api-Key-Id": "7"}, json={"voice_id": "voice_mine123", "text": "हाँ।"})
     assert keyed.status_code == 402
+
+
+def test_a_fine_tuned_voice_renders_with_its_adapter_and_hides_it(sb):
+    """The worker gets the adapter; the API only says the voice is fine tuned."""
+    client, auth, fake, _, _ = sb
+    voices = {v["id"]: v for v in client.get("/v1/voices", headers=auth).json()["voices"]}
+    assert voices["voice_tuned01"]["fine_tuned"] is True and voices["voice_mine123"]["fine_tuned"] is False
+    assert all("adapter" not in v for v in voices.values())
+    assert "adapter" not in client.get("/v1/voices/voice_tuned01", headers=auth).json()
+    worker = client.app.state.worker
+    worker.adapters = []
+    client.post("/v1/tts", headers=auth, json={"voice_id": "voice_tuned01", "text": "नमस्ते बेटा।", "format": "pcm"})
+    client.post("/v1/tts", headers=auth, json={"voice_id": "voice_mine123", "text": "नमस्ते बेटा।", "format": "pcm"})
+    assert worker.adapters == ["ritesh_step250", None]
