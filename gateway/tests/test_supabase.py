@@ -30,6 +30,12 @@ class FakePostgrest:
         self.refuse = set()          # request_ids usage_events rejects (as a foreign key error would)
         self.usage: dict[str, dict] = {}
         self.calls: list[str] = []
+        # Voice requests and their files in the voice-requests bucket, for automatic cloned voices.
+        self.requests: dict[int, dict] = {}
+        self.files: dict[str, bytes] = {}
+        self.allowance = {"clone_limit": 3, "clones_used": 0, "fine_tune_limit": 0, "fine_tunes_used": 0}
+        self.completed: list[dict] = []
+        self.complete_error: str | None = None
         self.voices = [
             {"id": "voice_mine123", "user_id": USER, "name": "Ritesh Sir", "speaker_name": "Ritesh",
              "status": "active", "reference_seconds": "8.0", "created_at": "2026-10-27T10:00:00+00:00",
@@ -47,6 +53,28 @@ class FakePostgrest:
         self.calls.append(path)
         if self.down:
             raise httpx.ConnectError("down")
+        if path == "/storage/v1/object/list/voice-requests":
+            prefix = json.loads(request.content)["prefix"] + "/"
+            return httpx.Response(200, json=[{"name": p.removeprefix(prefix), "id": p, "metadata": {"size": len(b)}}
+                                             for p, b in self.files.items() if p.startswith(prefix)])
+        if path.startswith("/storage/v1/object/voice-requests/"):
+            data = self.files.get(path.removeprefix("/storage/v1/object/voice-requests/"))
+            return httpx.Response(200, content=data) if data is not None else httpx.Response(404, json={"error": "not found"})
+        if path == "/voice_requests":
+            rid, uid = int(request.url.params["id"].removeprefix("eq.")), request.url.params["user_id"].removeprefix("eq.")
+            row = self.requests.get(rid)
+            return httpx.Response(200, json=[row] if row and row["user_id"] == uid else [])
+        if path == "/rpc/voice_allowance":
+            return httpx.Response(200, json=[self.allowance])
+        if path == "/rpc/record_clone_check":
+            row = self.requests[json.loads(request.content)["p_request"]]
+            row["auto_attempts"] += 1
+            return httpx.Response(200, json=row["auto_attempts"])
+        if path == "/rpc/complete_clone_request":
+            if self.complete_error:
+                return httpx.Response(400, json={"code": "23514", "message": self.complete_error})
+            self.completed.append(json.loads(request.content))
+            return httpx.Response(200, content=b"")
         if path == "/rpc/verify_api_key":
             ok = json.loads(request.content)["p_key"] == KEY and self.revoked_at is None
             return httpx.Response(200, json=[{"user_id": USER, "api_key_id": 7, "plan": "payg", "status": self.status}] if ok else [])
@@ -293,3 +321,85 @@ def test_a_fine_tuned_voice_renders_with_its_adapter_and_hides_it(sb):
     client.post("/v1/tts", headers=auth, json={"voice_id": "voice_tuned01", "text": "नमस्ते बेटा।", "format": "pcm"})
     client.post("/v1/tts", headers=auth, json={"voice_id": "voice_mine123", "text": "नमस्ते बेटा।", "format": "pcm"})
     assert worker.adapters == ["ritesh_step250", None]
+
+
+def tone_wav(seconds: float, sr: int = 16000, hz: float = 220.0) -> bytes:
+    """A real WAV file, so ffmpeg has something to convert."""
+    import io, math, struct, wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1), w.setsampwidth(2), w.setframerate(sr)
+        w.writeframes(b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * hz * i / sr)))
+                               for i in range(int(seconds * sr))))
+    return buf.getvalue()
+
+
+@pytest.fixture
+def clone(sb):
+    """A cloned voice request with an 8 s recording and a consent recording, and a transcript that has
+    every code word."""
+    client, _, fake, _, _ = sb
+    fake.requests[101] = {"id": 101, "user_id": USER, "kind": "clone", "consent": "phrase", "status": "draft",
+                          "consent_words": ["mango", "rocket", "violin"], "auto_attempts": 0}
+    fake.files[f"{USER}/101/reference/a-lesson.wav"] = tone_wav(8)
+    fake.files[f"{USER}/101/consent/b-consent.wav"] = tone_wav(4, hz=180)
+    client.app.state.transcriber.text = "I consent ... My verification code is mango, rocket, violin."
+    return client, fake, {"Authorization": f"Bearer {SESSION}"}
+
+
+def test_a_cloned_voice_is_made_automatically(clone):
+    client, fake, session = clone
+    r = client.post("/v1/dashboard/voice-requests/101/clone", headers=session)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["passed"] is True and body["voice_id"].startswith("voice_") and 7.5 <= body["reference_seconds"] <= 8.5
+    assert (settings.voices_dir / body["voice_id"] / "reference.wav").exists()
+    assert client.app.state.worker.put == [body["voice_id"]]
+    done = fake.completed[0]
+    assert done["p_request"] == 101 and done["p_voice_id"] == body["voice_id"] and done["p_check"]["passed"] is True
+    assert "transcript" not in body["checks"]  # the transcript is kept for audit, not echoed back
+    assert client.app.state.transcriber.calls[-1][2] == "en"
+
+
+def test_a_failed_check_says_what_was_missing_and_counts(clone):
+    client, fake, session = clone
+    client.app.state.transcriber.text = "My verification code is mango, rocket."
+    r = client.post("/v1/dashboard/voice-requests/101/clone", headers=session)
+    assert r.status_code == 422
+    assert r.json()["checks"]["code_words"] == {"passed": False, "missing": ["violin"]}
+    assert r.json()["attempts_left"] == 4 and fake.requests[101]["auto_attempts"] == 1 and not fake.completed
+    client.app.state.transcriber.text = "mango rocket violin"
+    client.app.state.worker.similarity = 0.2
+    r = client.post("/v1/dashboard/voice-requests/101/clone", headers=session)
+    assert r.status_code == 422 and r.json()["checks"]["same_speaker"] == {"passed": False}
+
+
+def test_only_open_cloned_voices_with_a_spoken_phrase(clone):
+    client, fake, session = clone
+    url = "/v1/dashboard/voice-requests/101/clone"
+    assert client.post(url).status_code == 401
+    assert client.post("/v1/dashboard/voice-requests/999/clone", headers=session).status_code == 404
+    for field, value, code in [("kind", "fine_tune", 400), ("consent", "release", 400), ("status", "submitted", 409),
+                               ("auto_attempts", 5, 429)]:
+        old = fake.requests[101][field]
+        fake.requests[101][field] = value
+        assert client.post(url, headers=session).status_code == code, field
+        fake.requests[101][field] = old
+    fake.allowance = {"clone_limit": 3, "clones_used": 3, "fine_tune_limit": 0, "fine_tunes_used": 0}
+    assert client.post(url, headers=session).status_code == 409
+    fake.allowance["clones_used"] = 0
+    del fake.files[f"{USER}/101/consent/b-consent.wav"]
+    assert "consent" in client.post(url, headers=session).json()["detail"]
+    fake.status = "pending"
+    client.app.state.accounts._cache.clear()
+    assert client.post(url, headers=session).status_code == 403
+
+
+def test_a_database_refusal_leaves_nothing_behind(clone):
+    client, fake, session = clone
+    fake.complete_error = "Your plan includes 3 cloned voices, and all are in use. Change your plan to add more."
+    r = client.post("/v1/dashboard/voice-requests/101/clone", headers=session)
+    assert r.status_code == 409 and r.json()["detail"] == fake.complete_error
+    worker = client.app.state.worker
+    assert worker.deleted == worker.put and not (settings.voices_dir / worker.put[0]).exists()

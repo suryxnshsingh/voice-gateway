@@ -27,6 +27,16 @@ class FakeWorker:
     async def health(self):
         return {"tts": {"model": "internal-model-path"}}
 
+    async def put_voice(self, voice_id, wav):
+        self.put = getattr(self, "put", []) + [voice_id]
+        return {"voice_id": voice_id}
+
+    async def delete_voice(self, voice_id):
+        self.deleted = getattr(self, "deleted", []) + [voice_id]
+
+    async def speaker_similarity(self, a, b):
+        return getattr(self, "similarity", 0.8)
+
     async def tts(self, voice_id, text, sr, result, timesteps=None, adapter=None):
         self.calls.append((text, sr, timesteps))
         self.adapters = getattr(self, "adapters", []) + [adapter]
@@ -40,12 +50,13 @@ class FakeTranscriber:
 
     def __init__(self, fail=None):
         self.fail, self.calls = fail, []
+        self.text = "सर, mitochondria क्या है?"
 
     async def transcribe(self, data, filename, language, prompt):
         self.calls.append((len(data), filename, language, prompt))
         if self.fail:
             raise self.fail
-        return Transcript(text="सर, mitochondria क्या है?", seconds=3.2)
+        return Transcript(text=self.text, seconds=3.2)
 
 
 @pytest.fixture

@@ -154,12 +154,8 @@ class SupabaseAccounts:
         _require_active(row["status"])
         return Customer(id=row["user_id"], name="", key_id=row["api_key_id"])
 
-    async def for_session(self, access_token: str, key_id: str | None = None) -> Customer | None:
-        """A dashboard session: Supabase Auth says whose it is, the profile says whether it may be used.
-
-        A customer's playground names one of their live API keys (`key_id`), and its requests count
-        against that key like any other. An admin may leave it out: those requests skip the credit check
-        and Supabase prices them at 0, since they carry no key."""
+    async def session_user(self, access_token: str) -> tuple[str, str, str | None] | None:
+        """Whose dashboard session this is: (user id, account status, role), or None if it isn't one."""
         digest = hashlib.sha256(access_token.encode()).hexdigest()
 
         async def user():
@@ -179,9 +175,18 @@ class SupabaseAccounts:
             return (rows[0]["status"], rows[0].get("role")) if rows else None
 
         found = await self._cached(("profile", user_id), profile)
+        return None if found is None else (user_id, found[0], found[1])
+
+    async def for_session(self, access_token: str, key_id: str | None = None) -> Customer | None:
+        """A dashboard session: Supabase Auth says whose it is, the profile says whether it may be used.
+
+        A customer's playground names one of their live API keys (`key_id`), and its requests count
+        against that key like any other. An admin may leave it out: those requests skip the credit check
+        and Supabase prices them at 0, since they carry no key."""
+        found = await self.session_user(access_token)
         if found is None:
             return None
-        status, role = found
+        user_id, status, role = found
         _require_active(status)
 
         if not key_id:
@@ -233,6 +238,45 @@ class SupabaseAccounts:
 
     async def voice(self, customer: Customer, voice_id: str) -> dict | None:
         return next((v for v in await self.voices(customer) if v["id"] == voice_id), None)
+
+    # Voice requests, for automatic cloned voices from the dashboard (dashboard_clone.py). -------
+
+    async def clone_request(self, request_id: int, user_id: str) -> dict | None:
+        rows = await self._call("GET", "/voice_requests", params={
+            "select": "id,user_id,kind,consent,status,consent_words,auto_attempts",
+            "id": f"eq.{request_id}", "user_id": f"eq.{user_id}"})
+        return rows[0] if rows else None
+
+    async def allowance(self, user_id: str) -> dict:
+        rows = await self._call("POST", "/rpc/voice_allowance", json={"p_user": user_id})
+        return rows[0] if rows else {"clone_limit": 0, "clones_used": 0, "fine_tune_limit": 0, "fine_tunes_used": 0}
+
+    async def request_files(self, user_id: str, request_id: int, folder: str) -> list[dict]:
+        """A folder of a request in the voice-requests bucket, oldest first: [{"name", "path", "size"}]."""
+        prefix = f"{user_id}/{request_id}/{folder}"
+        r = await self.http.post(self.url + "/storage/v1/object/list/voice-requests", json={
+            "prefix": prefix, "limit": 100, "offset": 0, "sortBy": {"column": "created_at", "order": "asc"}})
+        if r.status_code >= 300:
+            raise SupabaseError(r.status_code, r.text)
+        return [{"name": o["name"], "path": f"{prefix}/{o['name']}", "size": (o.get("metadata") or {}).get("size", 0)}
+                for o in r.json() if o.get("id")]
+
+    async def download(self, path: str) -> bytes:
+        r = await self.http.get(self.url + f"/storage/v1/object/voice-requests/{path}")
+        if r.status_code >= 300:
+            raise SupabaseError(r.status_code, r.text)
+        return r.content
+
+    async def record_clone_check(self, request_id: int, check: dict) -> int:
+        return int(await self._call("POST", "/rpc/record_clone_check", json={"p_request": request_id, "p_check": check}))
+
+    async def complete_clone_request(self, request_id: int, voice_id: str, seconds: float, check: dict) -> None:
+        await self._call("POST", "/rpc/complete_clone_request", json={
+            "p_request": request_id, "p_voice_id": voice_id, "p_reference_seconds": round(seconds, 1), "p_check": check})
+
+    def forget_voices(self, user_id: str) -> None:
+        """A new voice is usable at once, not after the voices cache expires."""
+        self._cache.pop(("voices", user_id), None)
 
     async def balance_paise(self, customer: Customer) -> float | None:
         async def fetch():

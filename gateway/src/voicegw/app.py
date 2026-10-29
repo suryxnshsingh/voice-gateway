@@ -23,6 +23,7 @@ from .limits import Limiter
 from .providers.llm import LLM
 from .providers.transcribe import Transcriber
 from .providers.worker import WorkerClient
+from .dashboard_clone import router as dashboard_clone_router
 from .public_api import router as public_router
 from .session import Deps, Session
 
@@ -74,6 +75,7 @@ app = FastAPI(
     redoc_url=None,
 )
 app.include_router(public_router)
+app.include_router(dashboard_clone_router)
 # The API authenticates with bearer keys, never cookies, so any site may call it (the dashboard, a
 # customer's own front end with a browser token).
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
