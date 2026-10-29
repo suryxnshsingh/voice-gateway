@@ -106,14 +106,14 @@ curl https://api.dhvni.in/v1/stt -H "Authorization: Bearer $KEY" -F file=@questi
 
 ## Errors and limits
 
-Errors are JSON with a `detail` message: `{"detail": "..."}`.
+Errors are JSON with a `detail` message: `{"detail": "..."}`. Some also carry a `code` to act on, like `{"detail": "...", "code": "voice_demo_only"}`.
 
 | Status | When |
 |---|---|
 | 400 | bad input: unknown model, empty file, audio that can't be processed |
 | 401 | missing, wrong or revoked API key |
 | 402 | the account's credit balance is used up (only when prepaid credit is enforced) |
-| 403 | the account is waiting for approval or suspended |
+| 403 | the account is waiting for approval or suspended; or, with `code` `voice_demo_only`, the voice is a demo: it plays only in the dashboard's playground until you unlock it there |
 | 404 | the voice isn't on your account |
 | 413 | text longer than 5,000 characters, or a file larger than 25 MB |
 | 429 | too many requests (120 a minute) or too many at once (4 text-to-speech, 8 speech-to-text). Retry after the `Retry-After` header's seconds |

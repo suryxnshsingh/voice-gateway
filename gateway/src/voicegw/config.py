@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     playground_stt_seconds_per_day: float = 600   # per account and India day
     playground_requests_per_minute: int = 10      # per account
     playground_concurrency: int = 1               # per account, for each of TTS and STT
+    # Demo voices: a fine tuned voice an admin marks demo (Supabase voices.demo), for its account to hear
+    # before unlocking it. Free, only in the playground, within these caps per voice, and never with a key.
+    demo_tts_chars_per_day: int = 3000            # per voice and India day
+    demo_tts_chars_total: int = 20000             # per voice, since it became a demo
 
     host: str = "127.0.0.1"
     port: int = 8000

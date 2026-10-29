@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from starlette.websockets import WebSocketDisconnect
 
 from .audio import FORMATS, AudioError, StreamEncoder, encode, ffmpeg_convert, pcm_seconds
+from .accounts import demo_only
 from .auth import CurrentCustomer, bearer, mint_session_token, read_session_claims
 from .config import settings
 from .db import Customer
@@ -84,7 +85,8 @@ class Meter:
     def failed(self, e: HTTPException) -> HTTPException:
         """Logs the failure and returns it with X-Request-Id, for `raise meter.failed(e)`."""
         self.done(e.status_code)
-        return HTTPException(e.status_code, e.detail, headers={**(e.headers or {}), "X-Request-Id": self.rid})
+        e.headers = {**(e.headers or {}), "X-Request-Id": self.rid}
+        return e
 
 
 async def _check_credit(app, customer: Customer) -> None:
@@ -99,6 +101,8 @@ async def _voice_for(app, customer: Customer, voice_id: str) -> dict:
     v = await app.state.accounts.voice(customer, voice_id)
     if v is None:
         raise HTTPException(404, f"Voice {voice_id} not found on this account.")
+    if v.get("demo") and not customer.playground:
+        raise demo_only(voice_id)  # a key, or a browser token made from one, on any path
     if not (settings.voices_dir / voice_id / "reference.wav").exists():
         log.error("voice %s is live for %s but this gateway has no reference audio for it", voice_id, customer.id)
         raise HTTPException(503, "This voice is not available right now. Please retry later.")
@@ -179,8 +183,9 @@ async def tts(body: TTSRequest, request: Request, customer: Customer = CurrentCu
         if not pieces:
             raise HTTPException(400, "Nothing to speak in that text.")
         if customer.playground:
-            playground.check_tts_allowance(app, customer, len(body.text))
-        await _check_credit(app, customer)
+            meter.source = playground.check_tts(app, customer, voice, len(body.text))
+        if meter.source != "demo":  # demo voices are free, so they play on a balance of 0
+            await _check_credit(app, customer)
         limiter = playground.limiter(app, customer)
         slot = limiter.acquire(customer.id, "tts")
     except HTTPException as e:
@@ -298,7 +303,8 @@ async def tts_stream(ws: WebSocket, voice_id: str = Query(...), sample_rate: int
         slot = app.state.limiter.acquire(customer.id, "tts")
     except HTTPException as e:
         meter.done(e.status_code)
-        await ws.send_json({"type": "error", "status": e.status_code, "message": e.detail})
+        await ws.send_json({"type": "error", "status": e.status_code, "message": e.detail}
+                           | ({"code": e.code} if getattr(e, "code", None) else {}))
         await ws.close()
         return
     steps = QUALITY_STEPS[quality]
@@ -404,6 +410,8 @@ async def stt(request: Request, file: UploadFile = File(..., description="mp3, m
     try:
         if model and model != settings.brand_stt_model:
             raise HTTPException(400, f"Unknown model {model!r}.")
+        if customer.playground:
+            playground.needs_key(customer)
         max_bytes = settings.playground_stt_max_bytes if customer.playground else settings.stt_max_bytes
         data = await file.read(max_bytes + 1)
         if len(data) > max_bytes:

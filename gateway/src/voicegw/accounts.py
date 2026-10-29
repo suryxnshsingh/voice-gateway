@@ -49,9 +49,26 @@ def public_voice(v: dict) -> dict:
     }
 
 
-def without_adapter(v: dict) -> dict:
-    """What the API shows of a voice: whether it is fine tuned, never which adapter it runs on."""
-    return {k: x for k, x in v.items() if k != "adapter"}
+HIDDEN_FIELDS = {"adapter", "demo", "demo_until", "demo_since"}
+
+
+def api_voice(v: dict) -> dict:
+    """What the API shows of a voice: whether it is fine tuned, never which adapter it runs on. Demo
+    voices are never shown to a key at all (app.list_voices)."""
+    return {k: x for k, x in v.items() if k not in HIDDEN_FIELDS}
+
+
+class CodedError(HTTPException):
+    """An error with a stable `code` next to its message, for clients to act on."""
+
+    def __init__(self, status: int, code: str, detail: str, headers: dict | None = None):
+        super().__init__(status, detail, headers)
+        self.code = code
+
+
+def demo_only(voice_id: str) -> CodedError:
+    return CodedError(403, "voice_demo_only", f"Voice {voice_id} is a demo: it plays only in your dashboard's "
+                      "playground. Unlock it from Voices in your Dhvni dashboard to use it with an API key.")
 
 
 def _unix(ts: str | None) -> float | None:
@@ -182,7 +199,8 @@ class SupabaseAccounts:
 
         A customer's playground names one of their live API keys (`key_id`), and its requests count
         against that key like any other. An admin may leave it out: those requests skip the credit check
-        and Supabase prices them at 0, since they carry no key."""
+        and Supabase prices them at 0, since they carry no key. So may a customer, but then only their
+        demo voices play, which are free."""
         found = await self.session_user(access_token)
         if found is None:
             return None
@@ -190,9 +208,8 @@ class SupabaseAccounts:
         _require_active(status)
 
         if not key_id:
-            if role == "admin":
-                return Customer(id=user_id, name="", free=True, playground=True)
-            raise HTTPException(400, "Choose one of your API keys to use the playground.")
+            # Without a key, a customer may only play their demo voices (playground.needs_key).
+            return Customer(id=user_id, name="", free=role == "admin", playground=True)
         if not key_id.isdigit():
             raise HTTPException(400, "X-Api-Key-Id must be the id of one of your API keys.")
 
@@ -224,7 +241,8 @@ class SupabaseAccounts:
     async def voices(self, customer: Customer) -> list[dict]:
         async def fetch():
             return await self._call("GET", "/voices", params={
-                "select": "id,user_id,name,speaker_name,status,reference_seconds,adapter,created_at,activated_at",
+                "select": "id,user_id,name,speaker_name,status,reference_seconds,adapter,created_at,activated_at,"
+                          "demo,demo_until,demo_since",
                 "status": "eq.active", "or": f"(user_id.eq.{customer.id},user_id.is.null)",
                 "order": "created_at.desc"})
 
@@ -234,6 +252,7 @@ class SupabaseAccounts:
             "shared": v["user_id"] is None, "reference_seconds": float(v["reference_seconds"]),
             "fine_tuned": bool(v.get("adapter")), "adapter": v.get("adapter"),
             "created_at": _unix(v["created_at"]), "activated_at": _unix(v["activated_at"]),
+            "demo": bool(v.get("demo")), "demo_until": _unix(v.get("demo_until")), "demo_since": _unix(v.get("demo_since")),
         } for v in rows]
 
     async def voice(self, customer: Customer, voice_id: str) -> dict | None:

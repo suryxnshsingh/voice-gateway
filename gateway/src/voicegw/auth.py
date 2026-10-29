@@ -63,7 +63,7 @@ def looks_like_session(token: str) -> bool:
 
 # All a dashboard session may do: the playground's own calls. Not /v1/tokens, so a session can never
 # open the streaming WebSocket, and nothing else that would make it stand in for an API key.
-PLAYGROUND_ROUTES = {("POST", "/v1/tts"), ("POST", "/v1/stt"), ("GET", "/v1/playground")}
+PLAYGROUND_ROUTES = {("POST", "/v1/tts"), ("POST", "/v1/stt"), ("GET", "/v1/playground"), ("POST", "/v1/playground/refresh")}
 
 
 def check_playground_request(request: Request) -> None:

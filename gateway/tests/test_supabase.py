@@ -46,6 +46,11 @@ class FakePostgrest:
             {"id": "voice_tuned01", "user_id": USER, "name": "Ritesh Sir, fine tuned", "speaker_name": "Ritesh",
              "status": "active", "reference_seconds": "1320.0", "adapter": "ritesh_step250",
              "created_at": "2026-10-28T10:00:00+00:00", "activated_at": "2026-10-28T11:00:00+00:00"},
+            # A teacher the team fine-tuned for this account to try before unlocking it.
+            {"id": "voice_demo001", "user_id": USER, "name": "Gaurav Sir, demo", "speaker_name": "Gaurav",
+             "status": "active", "reference_seconds": "1500.0", "adapter": "gaurav_step350", "demo": True,
+             "demo_until": None, "demo_since": "2026-10-29T10:00:00+00:00",
+             "created_at": "2026-10-29T10:00:00+00:00", "activated_at": "2026-10-29T10:00:00+00:00"},
         ]
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
@@ -120,7 +125,7 @@ def sb(tmp_path, monkeypatch):
                                     transport=httpx.MockTransport(fake))
         app.state.db, app.state.accounts = db, accounts
         app.state.worker, app.state.transcriber = FakeWorker(), FakeTranscriber()
-        for vid in ("voice_mine123", "voice_shared1", "voice_tuned01"):
+        for vid in ("voice_mine123", "voice_shared1", "voice_tuned01", "voice_demo001"):
             (tmp_path / "voices" / vid).mkdir(parents=True)
             (tmp_path / "voices" / vid / "reference.wav").write_bytes(b"RIFF")
         yield client, {"Authorization": f"Bearer {KEY}"}, fake, db, UsageSync(db, accounts.http)
@@ -313,6 +318,8 @@ def test_a_customer_session_needs_one_of_their_keys(sb):
     tts = {"voice_id": "voice_mine123", "text": "हाँ।"}
     r = client.post("/v1/tts", headers=PLAYGROUND, json=tts)
     assert r.status_code == 400 and "API keys" in r.json()["detail"]
+    stt = client.post("/v1/stt", headers=PLAYGROUND, files={"file": ("q.wav", tone_wav(1), "audio/wav")})
+    assert stt.status_code == 400 and "API keys" in stt.json()["detail"]
     assert client.post("/v1/tts", headers={**PLAYGROUND, "X-Api-Key-Id": "8"}, json=tts).status_code == 403
     assert client.post("/v1/tts", headers={**PLAYGROUND, "X-Api-Key-Id": "seven"}, json=tts).status_code == 400
     fake.revoked_at = "2026-10-29T10:00:00+00:00"
@@ -525,3 +532,101 @@ def test_a_database_refusal_leaves_nothing_behind(clone):
     assert r.status_code == 409 and r.json()["detail"] == fake.complete_error
     worker = client.app.state.worker
     assert worker.deleted == worker.put and not (settings.voices_dir / worker.put[0]).exists()
+
+
+# Demo voices ----------------------------------------------------------------------------------------
+
+
+def _demo_refused(r) -> bool:
+    return r.status_code == 403 and r.json()["code"] == "voice_demo_only" and "dashboard" in r.json()["detail"]
+
+
+def test_a_key_never_gets_a_demo_voice(sb):
+    """Every path a key (or a browser token made from one) can take is refused, with a code to act on."""
+    client, auth, fake, db, _ = sb
+    demo = {"voice_id": "voice_demo001", "text": "नमस्ते बेटा।", "format": "pcm"}
+    assert _demo_refused(client.post("/v1/tts", headers=auth, json=demo))
+    r = client.post("/v1/tts", headers=auth, json=demo | {"stream": True})
+    assert _demo_refused(r) and r.headers["x-request-id"].startswith("req_")
+    assert _demo_refused(client.get("/v1/voices/voice_demo001", headers=auth))
+    assert "voice_demo001" not in [v["id"] for v in client.get("/v1/voices", headers=auth).json()["voices"]]
+    token = client.post("/v1/tokens", headers=auth).json()["token"]
+    for url, headers in [("/v1/tts/stream?voice_id=voice_demo001", auth),
+                         (f"/v1/tts/stream?voice_id=voice_demo001&token={token}", {})]:
+        with client.websocket_connect(url, headers=headers) as ws:
+            ev = ws.receive_json()
+        assert ev["type"] == "error" and ev["status"] == 403 and ev["code"] == "voice_demo_only", url
+    assert client.app.state.worker.calls == []  # nothing was spoken
+    statuses = [r["status_code"] for r in db.pending_requests(10)]
+    assert statuses == [403, 403, 403, 403]
+
+
+async def test_a_demo_voice_plays_free_in_the_playground(sb, monkeypatch):
+    """No key needed, no credit check (it works on a balance below 0), logged as demo, which is free, and
+    not counted against the account's playground allowance."""
+    client, auth, fake, db, sync = sb
+    fake.balance = -1194
+    monkeypatch.setattr(settings, "require_credit", True)
+    line = {"voice_id": "voice_demo001", "text": "नमस्ते बेटा, कैसे हो।", "format": "pcm", "stream": True}
+    r = client.post("/v1/tts", headers=PLAYGROUND, json=line)
+    assert r.status_code == 200 and len(r.content) > 0
+    assert client.post("/v1/tts", headers={**PLAYGROUND, "X-Api-Key-Id": "7"}, json=line).status_code == 200
+    assert client.app.state.worker.adapters[-1] == "gaurav_step350"
+    # Anything else still needs a key and credit.
+    assert client.post("/v1/tts", headers=PLAYGROUND, json=line | {"voice_id": "voice_mine123"}).status_code == 400
+    assert client.post("/v1/tts", headers={**PLAYGROUND, "X-Api-Key-Id": "7"},
+                       json=line | {"voice_id": "voice_mine123"}).status_code == 402
+    assert client.post("/v1/tts", headers=PLAYGROUND, json=line | {"text": "अ" * 301}).status_code == 413
+    assert await sync.flush() == 5
+    demo_rows = [r for r in fake.usage.values() if r["status_code"] == 200]
+    assert [(r["source"], r["api_key_id"]) for r in demo_rows] == [("demo", None), ("demo", 7)]
+    left = client.get("/v1/playground", headers=PLAYGROUND).json()
+    assert left["tts"]["characters_left"] == 3000  # demo playback isn't the account's allowance
+    (voice,) = left["demo"]["voices"]
+    assert voice["voice_id"] == "voice_demo001" and voice["ended"] is False and voice["demo_until"] is None
+    assert voice["characters_left_today"] == 3000 - 2 * len(line["text"])
+    assert voice["characters_left_total"] == 20000 - 2 * len(line["text"])
+    assert left["demo"]["characters_per_day"] == 3000 and left["demo"]["characters_total"] == 20000
+
+
+def test_demo_caps_per_day_and_in_all(sb, monkeypatch):
+    client, _, fake, db, _ = sb
+    line = "नमस्ते बेटा, कैसे हो।"
+    play = lambda: client.post("/v1/tts", headers=PLAYGROUND, json={"voice_id": "voice_demo001", "text": line})
+    monkeypatch.setattr(settings, "demo_tts_chars_per_day", len(line) + 5)
+    assert play().status_code == 200
+    r = play()
+    assert r.status_code == 429 and r.json()["code"] == "voice_demo_daily" and "5 of" in r.json()["detail"]
+    monkeypatch.setattr(settings, "demo_tts_chars_per_day", 3000)
+    monkeypatch.setattr(settings, "demo_tts_chars_total", 2 * len(line) + 1)
+    assert play().status_code == 200
+    r = play()
+    assert r.status_code == 429 and r.json()["code"] == "voice_demo_used_up" and "Unlock" in r.json()["detail"]
+    # Made a demo again (a new demo_since): only plays since then count.
+    fake.voices[3]["demo_since"] = "2099-01-01T00:00:00+00:00"
+    client.app.state.accounts._cache.clear()
+    left = client.get("/v1/playground", headers=PLAYGROUND).json()["demo"]["voices"][0]
+    assert left["characters_left_total"] == 2 * len(line) + 1
+
+
+def test_an_ended_demo_is_refused_in_the_playground_too(sb):
+    client, auth, fake, _, _ = sb
+    fake.voices[3]["demo_until"] = "2026-10-29T18:30:00+00:00"  # 30 October, India time
+    r = client.post("/v1/tts", headers=PLAYGROUND, json={"voice_id": "voice_demo001", "text": "हाँ।"})
+    assert r.status_code == 403 and r.json() == {
+        "detail": "This demo ended on 30 October 2026. Unlock the voice to keep using it.", "code": "voice_demo_ended"}
+    assert client.get("/v1/playground", headers=PLAYGROUND).json()["demo"]["voices"][0]["ended"] is True
+    assert _demo_refused(client.post("/v1/tts", headers=auth, json={"voice_id": "voice_demo001", "text": "हाँ।"}))
+
+
+def test_an_unlocked_voice_works_with_a_key_at_once(sb):
+    """After an unlock the dashboard asks the gateway to read the account's voices again."""
+    client, auth, fake, _, _ = sb
+    demo = {"voice_id": "voice_demo001", "text": "हाँ।"}
+    assert _demo_refused(client.post("/v1/tts", headers=auth, json=demo))
+    fake.voices[3]["demo"] = False
+    assert _demo_refused(client.post("/v1/tts", headers=auth, json=demo))  # still cached
+    assert client.post("/v1/playground/refresh", headers=PLAYGROUND).status_code == 200
+    assert client.post("/v1/tts", headers=auth, json=demo).status_code == 200
+    assert "voice_demo001" in [v["id"] for v in client.get("/v1/voices", headers=auth).json()["voices"]]
+    assert client.post("/v1/playground/refresh", headers=auth).status_code == 404

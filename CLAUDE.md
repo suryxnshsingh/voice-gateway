@@ -86,6 +86,7 @@ The core is one `Session` per WebSocket: an asyncio state machine. The module do
 - **TTS** splits text with `SentenceSplitter`. It streams pcm/wav directly, and mp3/opus through an ffmpeg pipe (`audio.StreamEncoder`).
 - **Limits** (`limits.py`) are in-process per customer. A streaming response holds its slot until the generator finishes.
 - **The dashboard's playground** (`playground.py`) calls the API with a Supabase session instead of a key (`Customer.playground`). A session only reaches `POST /v1/tts`, `POST /v1/stt` and `GET /v1/playground`, from `VG_PLAYGROUND_ORIGINS`, never `/v1/tokens` or a WebSocket. It gets small limits of its own, all `playground_*` in `config.py`: 300 characters a request, 3,000 a day per account, 2 minutes a recording, 10 minutes a day, 10 requests a minute, one at a time. Allowances count this gateway's `requests` rows with `source = 'playground'`.
+- **Demo voices** (Supabase `voices.demo`, set by an admin) play only in the playground: a key gets 403 `voice_demo_only` on every path (`_voice_for`), and `/v1/voices` leaves them out. In the playground they are free, need no key and skip the credit check, within `demo_tts_chars_per_day` and `demo_tts_chars_total` per voice until `demo_until`; their rows have `source = 'demo'`, priced at 0. `POST /v1/playground/refresh` drops the account's voices cache after an unlock.
 
 ### Worker (`worker/src/vgworker`)
 

@@ -9,10 +9,10 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from . import consent
-from .accounts import LocalAccounts, SupabaseAccounts, UsageSync, public_voice, without_adapter
+from .accounts import CodedError, LocalAccounts, SupabaseAccounts, UsageSync, api_voice, demo_only, public_voice
 from .audio import AudioError, ffmpeg_convert, pcm_seconds
 from .auth import CurrentCustomer, LocalCustomer, bearer, mint_session_token, read_session_token
 from .config import settings
@@ -84,6 +84,11 @@ app.include_router(playground_router)
 # customer's own front end with a browser token).
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
                    expose_headers=["X-Request-Id", "X-Audio-Seconds", "Retry-After"])
+
+
+@app.exception_handler(CodedError)
+async def coded_error(request: Request, e: CodedError):
+    return JSONResponse({"detail": e.detail, "code": e.code}, status_code=e.status_code, headers=e.headers)
 
 
 def _deps(app: FastAPI) -> Deps:
@@ -186,7 +191,8 @@ async def realtime(ws: WebSocket, token: str | None = Query(None)):
 
 @app.get("/v1/voices", tags=["voices"], summary="List your voices")
 async def list_voices(request: Request, customer: Customer = CurrentCustomer):
-    return {"voices": [without_adapter(v) for v in await request.app.state.accounts.voices(customer)]}
+    voices = await request.app.state.accounts.voices(customer)
+    return {"voices": [api_voice(v) for v in voices if not v.get("demo")]}  # demos never reach an integration
 
 
 @app.get("/v1/voices/{voice_id}", tags=["voices"], summary="Get a voice")
@@ -194,7 +200,9 @@ async def get_voice(voice_id: str, request: Request, customer: Customer = Curren
     v = await request.app.state.accounts.voice(customer, voice_id)
     if v is None:
         raise HTTPException(404, f"Voice {voice_id} not found on this account.")
-    return without_adapter(v)
+    if v.get("demo"):
+        raise demo_only(voice_id)
+    return api_voice(v)
 
 
 def _self_serve_only() -> None:
