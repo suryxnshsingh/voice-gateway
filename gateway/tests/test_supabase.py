@@ -396,6 +396,20 @@ def test_only_open_cloned_voices_with_a_spoken_phrase(clone):
     assert client.post(url, headers=session).status_code == 403
 
 
+def test_an_admin_clones_without_consent(clone):
+    client, fake, session = clone
+    fake.role = "admin"
+    del fake.files[f"{USER}/101/consent/b-consent.wav"]
+    calls = len(client.app.state.transcriber.calls)
+    r = client.post("/v1/dashboard/voice-requests/101/clone", headers=session)
+    assert r.status_code == 200, r.text
+    assert r.json()["checks"] == {"consent_skipped": True}
+    check = fake.completed[0]["p_check"]
+    assert check["passed"] is True and check["consent_skipped"] is True and check["skipped_by"] == USER
+    assert len(client.app.state.transcriber.calls) == calls  # nothing to hear
+    assert client.app.state.worker.put == [r.json()["voice_id"]]
+
+
 def test_a_database_refusal_leaves_nothing_behind(clone):
     client, fake, session = clone
     fake.complete_error = "Your plan includes 3 cloned voices, and all are in use. Change your plan to add more."

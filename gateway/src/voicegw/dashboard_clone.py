@@ -8,6 +8,10 @@ consent voice must be the same speaker as the reference. If both pass, the refer
 loaded on the worker, and Supabase adds the voice and marks the request live (complete_clone_request,
 which rechecks the plan's allowance). A cloned voice runs zero shot on the base model.
 
+An admin's own cloned voice skips the consent check, so the team can clone any voice: nothing is
+transcribed or compared, and the check it reports says consent_skipped, which complete_clone_request
+takes only for an admin and records as a voice made without consent.
+
 Fine-tuned voices never come through here: the team trains those by hand and links their adapter.
 """
 
@@ -56,7 +60,8 @@ async def clone_voice(request_id: int, request: Request):
     user = await accounts.session_user(token)
     if user is None:
         raise HTTPException(401, "Your session has ended. Sign in again.")
-    user_id, status, _role = user
+    user_id, status, role = user
+    admin = role == "admin"
     if status != "active":
         raise HTTPException(403, "Your account needs to be approved before it can have voices.")
 
@@ -81,7 +86,7 @@ async def clone_voice(request_id: int, request: Request):
     consents = await accounts.request_files(user_id, request_id, "consent")
     if not references:
         raise HTTPException(400, "Add a recording of the speaker first.")
-    if not consents:
+    if not consents and not admin:
         raise HTTPException(400, "Add the consent recording first.")
 
     # The reference: the speaker's recordings in upload order, joined and cut to REFERENCE_MAX_S.
@@ -100,6 +105,11 @@ async def clone_voice(request_id: int, request: Request):
     if seconds < settings.voice_min_seconds:
         raise HTTPException(400, f"The recordings come to {seconds:.0f} s. Add at least 10 seconds of the speaker talking.")
     reference = wav_bytes(pcm, REFERENCE_SR)
+
+    if admin:
+        check = {"passed": True, "consent_skipped": True, "skipped_by": user_id,
+                 "reference_seconds": round(seconds, 1), "checked_at": int(time.time())}
+        return await _make_voice(app, user_id, request_id, reference, seconds, check, {"consent_skipped": True})
 
     # The consent: the newest recording of the phrase.
     latest = consents[-1]
@@ -137,7 +147,15 @@ async def clone_voice(request_id: int, request: Request):
             "passed": False, "checks": public_checks,
             "attempts_left": max(0, settings.consent_max_attempts - attempts),
         })
+    log.info("clone %s passed, speaker %.2f", request_id, score)
+    return await _make_voice(app, user_id, request_id, reference, seconds, check, public_checks)
 
+
+async def _make_voice(app, user_id: str, request_id: int, reference: bytes, seconds: float, check: dict,
+                      public_checks: dict) -> dict:
+    """Store the reference, load it on the worker and have Supabase add the voice; undo all of it if
+    Supabase refuses."""
+    accounts = app.state.accounts
     voice_id = new_id("voice")
     vdir = settings.voices_dir / voice_id
     vdir.mkdir(parents=True, exist_ok=True)
@@ -156,5 +174,6 @@ async def clone_voice(request_id: int, request: Request):
         log.exception("clone %s failed after its check passed", request_id)
         raise HTTPException(503, "The voice could not be set up just now. Please retry.") from None
     accounts.forget_voices(user_id)
-    log.info("clone %s: %s live, %.1f s reference, speaker %.2f", request_id, voice_id, seconds, score)
+    log.info("clone %s: %s live, %.1f s reference%s", request_id, voice_id, seconds,
+             ", consent skipped by an admin" if check.get("consent_skipped") else "")
     return {"passed": True, "voice_id": voice_id, "reference_seconds": round(seconds, 1), "checks": public_checks}
