@@ -84,6 +84,9 @@ CREATE INDEX IF NOT EXISTS requests_pending ON requests(created_at) WHERE sync =
 MIGRATIONS = [
     "ALTER TABLE voices ADD COLUMN persona TEXT",    # default LLM instructions when a session sets none
     "ALTER TABLE voices ADD COLUMN greeting TEXT",   # spoken first when a session asks to be greeted
+    # Where a public request came from: api (a key or a browser token) | playground (a dashboard session).
+    "ALTER TABLE requests ADD COLUMN source TEXT NOT NULL DEFAULT 'api'",
+    "CREATE INDEX IF NOT EXISTS requests_playground ON requests(customer_id, created_at) WHERE source != 'api'",
 ]
 
 
@@ -101,6 +104,7 @@ class Customer:
     name: str
     key_id: int | None = None   # the Supabase api_keys row the request came in with
     free: bool = False          # an admin in the dashboard playground: no credit check, priced at 0 by Supabase
+    playground: bool = False    # a signed in dashboard session, not an API key: playground limits apply
 
 
 class DB:
@@ -241,10 +245,26 @@ class DB:
     def add_request(self, row: dict, sync: str) -> None:
         self._exec(
             "INSERT OR IGNORE INTO requests (request_id, customer_id, api_key_id, endpoint, voice_id, characters, "
-            "audio_seconds, status_code, latency_ms, created_at, sync) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "audio_seconds, status_code, latency_ms, created_at, sync, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (row["request_id"], row["customer_id"], row["api_key_id"], row["endpoint"], row["voice_id"],
-             row["characters"], row["audio_seconds"], row["status_code"], row["latency_ms"], row["created_at"], sync),
+             row["characters"], row["audio_seconds"], row["status_code"], row["latency_ms"], row["created_at"], sync,
+             row.get("source", "api")),
         )
+
+    def playground_used(self, customer_id: str, since: float, source: str = "playground",
+                        voice_id: str | None = None) -> dict[str, float]:
+        """TTS characters and STT seconds from the playground since `since`, for its allowances. A stream
+        the client stopped (499) counts in full: stopping before the end must not get round a limit."""
+        voice = " AND voice_id = ?" if voice_id else ""
+        row = self._one(
+            "SELECT COALESCE(SUM(CASE WHEN endpoint != 'stt' THEN characters END), 0) AS characters, "
+            "COALESCE(SUM(CASE WHEN endpoint = 'stt' THEN audio_seconds END), 0) AS stt_seconds, "
+            "MAX(created_at) AS last_at "
+            f"FROM requests WHERE customer_id = ? AND source = ? AND created_at >= ?{voice} "
+            "AND (status_code < 400 OR status_code = 499)",
+            (customer_id, source, since, *([voice_id] if voice_id else [])),
+        )
+        return {"characters": int(row["characters"]), "stt_seconds": float(row["stt_seconds"]), "last_at": row["last_at"]}
 
     def pending_requests(self, limit: int) -> list[dict]:
         return self._all("SELECT * FROM requests WHERE sync = 'pending' ORDER BY created_at LIMIT ?", (limit,))

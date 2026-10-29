@@ -24,6 +24,7 @@ from .providers.llm import LLM
 from .providers.transcribe import Transcriber
 from .providers.worker import WorkerClient
 from .dashboard_clone import router as dashboard_clone_router
+from .playground import router as playground_router
 from .public_api import router as public_router
 from .session import Deps, Session
 
@@ -42,6 +43,8 @@ async def lifespan(app: FastAPI):
     app.state.transcriber = Transcriber(settings.openai_key, settings.stt_relay_model)
     app.state.limiter = Limiter(settings.requests_per_minute,
                                 {"tts": settings.tts_concurrency, "stt": settings.stt_concurrency})
+    app.state.playground_limiter = Limiter(settings.playground_requests_per_minute,
+                                           {"tts": settings.playground_concurrency, "stt": settings.playground_concurrency})
     sync = None
     if settings.supabase_url:
         if not settings.supabase_secret_key:
@@ -76,6 +79,7 @@ app = FastAPI(
 )
 app.include_router(public_router)
 app.include_router(dashboard_clone_router)
+app.include_router(playground_router)
 # The API authenticates with bearer keys, never cookies, so any site may call it (the dashboard, a
 # customer's own front end with a browser token).
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],

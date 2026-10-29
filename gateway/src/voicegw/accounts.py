@@ -191,7 +191,7 @@ class SupabaseAccounts:
 
         if not key_id:
             if role == "admin":
-                return Customer(id=user_id, name="", free=True)
+                return Customer(id=user_id, name="", free=True, playground=True)
             raise HTTPException(400, "Choose one of your API keys to use the playground.")
         if not key_id.isdigit():
             raise HTTPException(400, "X-Api-Key-Id must be the id of one of your API keys.")
@@ -203,7 +203,7 @@ class SupabaseAccounts:
         rows = await self._cached(("session_key", key_id, user_id), key)
         if not rows or rows[0]["revoked_at"] is not None:
             raise HTTPException(403, "That API key is revoked or not on this account. Choose another one.")
-        return Customer(id=user_id, name="", key_id=int(key_id))
+        return Customer(id=user_id, name="", key_id=int(key_id), playground=True)
 
     async def for_token(self, claims: dict) -> Customer | None:
         """A browser token minted from a key: the key must still be live and the account active."""
@@ -305,6 +305,7 @@ class UsageSync:
             "characters": r["characters"], "audio_seconds": round(r["audio_seconds"], 2),
             "status_code": r["status_code"], "latency_ms": r["latency_ms"],
             "created_at": datetime.fromtimestamp(r["created_at"]).astimezone().isoformat(),
+            "source": r.get("source") or "api",
         }
 
     async def _post(self, rows: list[dict]) -> httpx.Response:

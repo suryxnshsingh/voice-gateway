@@ -32,6 +32,7 @@ from .audio import FORMATS, AudioError, StreamEncoder, encode, ffmpeg_convert, p
 from .auth import CurrentCustomer, bearer, mint_session_token, read_session_claims
 from .config import settings
 from .db import Customer
+from . import playground
 from .providers.transcribe import TranscribeError
 from .providers.worker import TtsResult, WorkerError
 from .text import SentenceSplitter
@@ -57,6 +58,7 @@ class Meter:
 
     def __init__(self, app, customer: Customer, endpoint: str, rid: str, voice_id: str | None = None):
         self.app, self.customer, self.endpoint, self.rid, self.voice_id = app, customer, endpoint, rid, voice_id
+        self.source = "playground" if customer.playground else "api"
         self.started = time.monotonic()
         self.characters = 0
         self.audio_seconds = 0.0
@@ -76,7 +78,7 @@ class Meter:
             "request_id": self.rid, "customer_id": self.customer.id, "api_key_id": self.customer.key_id,
             "endpoint": self.endpoint, "voice_id": self.voice_id, "characters": self.characters,
             "audio_seconds": self.audio_seconds, "status_code": status, "latency_ms": self.latency_ms,
-            "created_at": time.time(),
+            "created_at": time.time(), "source": self.source,
         }, "pending" if accounts.remote else "none")
 
     def failed(self, e: HTTPException) -> HTTPException:
@@ -168,14 +170,19 @@ async def tts(body: TTSRequest, request: Request, customer: Customer = CurrentCu
     try:
         if body.model and body.model != settings.brand_tts_model:
             raise HTTPException(400, f"Unknown model {body.model!r}.")
+        if customer.playground:
+            playground.check_tts_text(body.text)
         if len(body.text) > settings.tts_max_chars:
             raise HTTPException(413, f"Text is longer than {settings.tts_max_chars} characters.")
         voice = await _voice_for(app, customer, body.voice_id)
         pieces = _chunks(body.text)
         if not pieces:
             raise HTTPException(400, "Nothing to speak in that text.")
+        if customer.playground:
+            playground.check_tts_allowance(app, customer, len(body.text))
         await _check_credit(app, customer)
-        slot = app.state.limiter.acquire(customer.id, "tts")
+        limiter = playground.limiter(app, customer)
+        slot = limiter.acquire(customer.id, "tts")
     except HTTPException as e:
         raise meter.failed(e) from None
     steps, sr, fmt = QUALITY_STEPS[body.quality], body.sample_rate, body.format
@@ -198,7 +205,7 @@ async def tts(body: TTSRequest, request: Request, customer: Customer = CurrentCu
         except (WorkerError, AudioError, OSError) as e:
             raise meter.failed(_engine_error(e)) from e
         finally:
-            app.state.limiter.release(slot)
+            limiter.release(slot)
         meter.done()
         headers["X-Audio-Seconds"] = f"{len(pcm) / (2 * sr):.2f}"
         return Response(audio, media_type=media_type, headers=headers)
@@ -239,7 +246,7 @@ async def tts(body: TTSRequest, request: Request, customer: Customer = CurrentCu
             status = 500
             log.error("tts stream %s ended early: %r", rid, e)  # headers are sent; the stream just ends
         finally:
-            app.state.limiter.release(slot)
+            limiter.release(slot)
             meter.done(status)
 
     return StreamingResponse(stream(), media_type=media_type, headers=headers)
@@ -397,15 +404,18 @@ async def stt(request: Request, file: UploadFile = File(..., description="mp3, m
     try:
         if model and model != settings.brand_stt_model:
             raise HTTPException(400, f"Unknown model {model!r}.")
-        data = await file.read(settings.stt_max_bytes + 1)
-        if len(data) > settings.stt_max_bytes:
-            raise HTTPException(413, "Files are limited to 25 MB.")
+        max_bytes = settings.playground_stt_max_bytes if customer.playground else settings.stt_max_bytes
+        data = await file.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise HTTPException(413, f"Files are limited to {max_bytes // (1024 * 1024)} MB"
+                                     f"{' in the playground' if customer.playground else ''}.")
         if not data:
             raise HTTPException(400, "The file is empty.")
         if not app.state.transcriber.available:
             raise HTTPException(503, "Transcription is temporarily unavailable.")
+        decoded = await playground.check_stt(app, customer, data) if customer.playground else None
         await _check_credit(app, customer)
-        async with app.state.limiter.slot(customer.id, "stt"):
+        async with playground.limiter(app, customer).slot(customer.id, "stt"):
             try:
                 result = await app.state.transcriber.transcribe(data, file.filename or "audio.wav", language, prompt)
             except TranscribeError as e:
@@ -413,7 +423,7 @@ async def stt(request: Request, file: UploadFile = File(..., description="mp3, m
     except HTTPException as e:
         meter.latency_ms = round((time.monotonic() - meter.started) * 1000)
         raise meter.failed(e) from None
-    seconds = result.seconds
+    seconds = result.seconds if result.seconds is not None else decoded
     if seconds is None:
         with contextlib.suppress(AudioError):
             seconds = round(pcm_seconds(await ffmpeg_convert(data, 16000, "s16le"), 16000), 2)

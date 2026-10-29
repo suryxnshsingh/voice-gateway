@@ -85,6 +85,7 @@ The core is one `Session` per WebSocket: an asyncio state machine. The module do
 - **STT** is a straight relay of the uploaded file to `VG_STT_RELAY_MODEL`.
 - **TTS** splits text with `SentenceSplitter`. It streams pcm/wav directly, and mp3/opus through an ffmpeg pipe (`audio.StreamEncoder`).
 - **Limits** (`limits.py`) are in-process per customer. A streaming response holds its slot until the generator finishes.
+- **The dashboard's playground** (`playground.py`) calls the API with a Supabase session instead of a key (`Customer.playground`). A session only reaches `POST /v1/tts`, `POST /v1/stt` and `GET /v1/playground`, from `VG_PLAYGROUND_ORIGINS`, never `/v1/tokens` or a WebSocket. It gets small limits of its own, all `playground_*` in `config.py`: 300 characters a request, 3,000 a day per account, 2 minutes a recording, 10 minutes a day, 10 requests a minute, one at a time. Allowances count this gateway's `requests` rows with `source = 'playground'`.
 
 ### Worker (`worker/src/vgworker`)
 

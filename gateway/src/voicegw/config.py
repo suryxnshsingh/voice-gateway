@@ -31,6 +31,18 @@ class Settings(BaseSettings):
     tts_max_chars: int = 5000
     stt_max_bytes: int = 25 * 1024 * 1024
 
+    # The dashboard's playground: a signed in dashboard session in place of an API key, for hearing a
+    # voice on a few short lines, not for production use. Every playground limit is here (playground.py).
+    # A session only reaches POST /v1/tts, POST /v1/stt and GET /v1/playground, never a WebSocket.
+    playground_origins: list[str] = ["https://www.dhvni.in", "https://dhvni.in"]
+    playground_tts_max_chars: int = 300           # per request
+    playground_tts_chars_per_day: int = 3000      # per account and India day; admins have no daily limit
+    playground_stt_max_seconds: float = 120       # per recording
+    playground_stt_max_bytes: int = 10 * 1024 * 1024
+    playground_stt_seconds_per_day: float = 600   # per account and India day
+    playground_requests_per_minute: int = 10      # per account
+    playground_concurrency: int = 1               # per account, for each of TTS and STT
+
     host: str = "127.0.0.1"
     port: int = 8000
     data_dir: Path = Path("./data")

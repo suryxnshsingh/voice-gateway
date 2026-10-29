@@ -16,6 +16,7 @@ from test_public_api import FakeTranscriber, FakeWorker
 USER = "6f1c2b0e-0d5a-4d4e-9a57-2f4b8f0f3a11"
 KEY = "vg_" + "ab" * 24
 SESSION = "eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiI2ZjFjIn0.c2lnbmF0dXJl"  # a dashboard access token (shape only)
+PLAYGROUND = {"Authorization": f"Bearer {SESSION}", "Origin": "https://www.dhvni.in"}  # the dashboard's own calls
 
 
 class FakePostgrest:
@@ -258,55 +259,162 @@ def test_stream_engine_failure_reaches_the_client(sb):
     assert [(r["endpoint"], r["status_code"]) for r in db.pending_requests(5)] == [("tts_stream", 500)]
 
 
-async def test_dashboard_session_works_like_a_key(sb):
+async def test_dashboard_session_works_in_the_playground(sb):
     """The dashboard's playground calls the API with the signed in session, billed to a key it names."""
     client, _, fake, db, sync = sb
-    session = {"Authorization": f"Bearer {SESSION}", "X-Api-Key-Id": "7"}
-    assert [v["id"] for v in client.get("/v1/voices", headers=session).json()["voices"]] == [
-        "voice_mine123", "voice_shared1", "voice_tuned01"]
+    session = {**PLAYGROUND, "X-Api-Key-Id": "7"}
     r = client.post("/v1/tts", headers=session, json={"voice_id": "voice_mine123", "text": "नमस्ते बेटा।", "format": "pcm",
                                                       "stream": True})
     assert r.status_code == 200 and len(r.content) > 0
     assert await sync.flush() == 1
     row = next(iter(fake.usage.values()))
-    assert row["user_id"] == USER and row["api_key_id"] == 7 and row["endpoint"] == "tts"
-    bad = client.get("/v1/voices", headers={"Authorization": "Bearer eyJx.eyJy.expired"})
+    assert row["user_id"] == USER and row["api_key_id"] == 7 and row["endpoint"] == "tts" and row["source"] == "playground"
+    bad = client.post("/v1/tts", headers={**session, "Authorization": "Bearer eyJx.eyJy.expired"},
+                      json={"voice_id": "voice_mine123", "text": "हाँ।"})
     assert bad.status_code == 401
     fake.status = "pending"
     client.app.state.accounts._cache.clear()
-    r = client.get("/v1/voices", headers=session)
+    r = client.post("/v1/tts", headers=session, json={"voice_id": "voice_mine123", "text": "हाँ।"})
     assert r.status_code == 403 and "approval" in r.json()["detail"]
+
+
+async def test_key_requests_are_marked_api(sb):
+    client, auth, fake, _, sync = sb
+    assert client.post("/v1/tts", headers=auth, json={"voice_id": "voice_mine123", "text": "हाँ।"}).status_code == 200
+    assert await sync.flush() == 1
+    assert next(iter(fake.usage.values()))["source"] == "api"
+
+
+def test_a_session_only_reaches_the_playground(sb):
+    """A session can't stand in for a key: no voices list, no browser token (so no WebSocket), no usage,
+    and only from the dashboard's origin."""
+    from starlette.websockets import WebSocketDisconnect
+
+    client, _, fake, _, _ = sb
+    session = {**PLAYGROUND, "X-Api-Key-Id": "7"}
+    for method, path in [("GET", "/v1/voices"), ("GET", "/v1/voices/voice_mine123"), ("POST", "/v1/tokens"),
+                         ("GET", "/v1/models"), ("GET", "/v1/usage")]:
+        r = client.request(method, path, headers=session)
+        assert r.status_code == 403 and "playground" in r.json()["detail"], path
+    tts = {"voice_id": "voice_mine123", "text": "हाँ।"}
+    for origin in (None, "https://evil.example", "http://localhost:3000"):
+        headers = {k: v for k, v in session.items() if k != "Origin"} | ({"Origin": origin} if origin else {})
+        r = client.post("/v1/tts", headers=headers, json=tts)
+        assert r.status_code == 403 and "dashboard" in r.json()["detail"], origin
+    assert "/auth/v1/user" not in fake.calls  # refused before Supabase is asked
+    with pytest.raises(WebSocketDisconnect) as e:
+        with client.websocket_connect("/v1/tts/stream?voice_id=voice_mine123", headers=session) as ws:
+            ws.receive_json()
+    assert e.value.code == 4401
 
 
 def test_a_customer_session_needs_one_of_their_keys(sb):
     client, _, fake, _, _ = sb
-    bare = {"Authorization": f"Bearer {SESSION}"}
-    r = client.post("/v1/tts", headers=bare, json={"voice_id": "voice_mine123", "text": "हाँ।"})
+    tts = {"voice_id": "voice_mine123", "text": "हाँ।"}
+    r = client.post("/v1/tts", headers=PLAYGROUND, json=tts)
     assert r.status_code == 400 and "API keys" in r.json()["detail"]
-    other = client.post("/v1/tts", headers={**bare, "X-Api-Key-Id": "8"}, json={"voice_id": "voice_mine123", "text": "हाँ।"})
-    assert other.status_code == 403
-    assert client.get("/v1/voices", headers={**bare, "X-Api-Key-Id": "seven"}).status_code == 400
+    assert client.post("/v1/tts", headers={**PLAYGROUND, "X-Api-Key-Id": "8"}, json=tts).status_code == 403
+    assert client.post("/v1/tts", headers={**PLAYGROUND, "X-Api-Key-Id": "seven"}, json=tts).status_code == 400
     fake.revoked_at = "2026-10-29T10:00:00+00:00"
     client.app.state.accounts._cache.clear()
-    revoked = client.get("/v1/voices", headers={**bare, "X-Api-Key-Id": "7"})
+    revoked = client.post("/v1/tts", headers={**PLAYGROUND, "X-Api-Key-Id": "7"}, json=tts)
     assert revoked.status_code == 403 and "revoked" in revoked.json()["detail"]
 
 
 async def test_an_admin_session_without_a_key_is_free(sb, monkeypatch):
-    """Admins try things in the playground without a key: no credit check, and no key on the usage row,
-    which Supabase prices at 0."""
+    """Admins try things in the playground without a key: no credit check, no daily allowance, and no key
+    on the usage row, which Supabase prices at 0. The per-request limits still apply."""
     client, _, fake, _, sync = sb
     fake.role, fake.balance = "admin", 0
     monkeypatch.setattr(settings, "require_credit", True)
-    admin = {"Authorization": f"Bearer {SESSION}"}
-    r = client.post("/v1/tts", headers=admin, json={"voice_id": "voice_mine123", "text": "हाँ।", "format": "pcm"})
+    monkeypatch.setattr(settings, "playground_tts_chars_per_day", 1)
+    r = client.post("/v1/tts", headers=PLAYGROUND, json={"voice_id": "voice_mine123", "text": "हाँ।", "format": "pcm"})
     assert r.status_code == 200
-    assert client.post("/v1/stt", headers=admin, files={"file": ("q.wav", b"audio", "audio/wav")}).status_code == 200
+    stt = client.post("/v1/stt", headers=PLAYGROUND, files={"file": ("q.wav", tone_wav(1), "audio/wav")})
+    assert stt.status_code == 200
     assert await sync.flush() == 2
     assert {row["api_key_id"] for row in fake.usage.values()} == {None}
-    # With a key, an admin is billed like anyone else.
-    keyed = client.post("/v1/tts", headers={**admin, "X-Api-Key-Id": "7"}, json={"voice_id": "voice_mine123", "text": "हाँ।"})
-    assert keyed.status_code == 402
+    assert client.get("/v1/playground", headers=PLAYGROUND).json()["tts"]["characters_left"] is None
+    long = client.post("/v1/tts", headers=PLAYGROUND, json={"voice_id": "voice_mine123", "text": "अ" * 301})
+    assert long.status_code == 413
+    # With a key, an admin is billed and limited like anyone else.
+    keyed = {**PLAYGROUND, "X-Api-Key-Id": "7"}
+    assert client.post("/v1/tts", headers=keyed, json={"voice_id": "voice_mine123", "text": "हाँ।"}).status_code == 429
+    monkeypatch.setattr(settings, "playground_tts_chars_per_day", 3000)
+    assert client.post("/v1/tts", headers=keyed, json={"voice_id": "voice_mine123", "text": "हाँ।"}).status_code == 402
+
+
+def test_playground_text_and_daily_allowance(sb, monkeypatch):
+    """Short lines and a small daily allowance in the playground; a key keeps the API's limits."""
+    client, auth, _, db, _ = sb
+    line = "नमस्ते बेटा, कैसे हो।"
+    monkeypatch.setattr(settings, "playground_tts_chars_per_day", len(line) + 5)
+    session = {**PLAYGROUND, "X-Api-Key-Id": "7"}
+    long = client.post("/v1/tts", headers=session, json={"voice_id": "voice_mine123", "text": "अ" * 301})
+    assert long.status_code == 413 and "300 characters" in long.json()["detail"]
+    assert client.post("/v1/tts", headers=auth, json={"voice_id": "voice_mine123", "text": "अ" * 1000}).status_code == 200
+    assert client.post("/v1/tts", headers=session, json={"voice_id": "voice_mine123", "text": line}).status_code == 200
+    left = client.get("/v1/playground", headers=session).json()
+    assert left["tts"] == {"max_characters": 300, "characters_per_day": len(line) + 5, "characters_left": 5}
+    again = client.post("/v1/tts", headers=session, json={"voice_id": "voice_mine123", "text": line})
+    assert again.status_code == 429 and f"5 of {len(line) + 5} characters left" in again.json()["detail"]
+    assert client.post("/v1/tts", headers=session, json={"voice_id": "voice_mine123", "text": "हाँ।"}).status_code == 200
+    # A stream stopped before the end (499) counts in full; a refused request doesn't count.
+    db.add_request({"request_id": "req_stopped", "customer_id": USER, "api_key_id": 7, "endpoint": "tts",
+                    "voice_id": "voice_mine123", "characters": 1, "audio_seconds": 0, "status_code": 499,
+                    "latency_ms": None, "created_at": time.time(), "source": "playground"}, "none")
+    assert client.get("/v1/playground", headers=session).json()["tts"]["characters_left"] == 0
+    # Yesterday's use doesn't count today.
+    from voicegw.playground import day_start
+    assert db.playground_used(USER, day_start() + 86400)["characters"] == 0
+
+
+def test_playground_rate_and_one_at_a_time(sb):
+    from voicegw.limits import Limiter
+
+    client, auth, _, _, _ = sb
+    session = {**PLAYGROUND, "X-Api-Key-Id": "7"}
+    tts = {"voice_id": "voice_mine123", "text": "हाँ।"}
+    pg = client.app.state.playground_limiter
+    slot = pg.acquire(USER, "tts")  # a request still playing
+    busy = client.post("/v1/tts", headers=session, json=tts)
+    assert busy.status_code == 429 and "concurrent" in busy.json()["detail"]
+    assert client.post("/v1/tts", headers=auth, json=tts).status_code == 200  # keys have their own limits
+    pg.release(slot)
+    assert client.post("/v1/tts", headers=session, json=tts).status_code == 200
+    client.app.state.playground_limiter = Limiter(2, {"tts": 1, "stt": 1})
+    codes = [client.post("/v1/tts", headers=session, json=tts).status_code for _ in range(3)]
+    assert codes == [200, 200, 429]
+
+
+def test_playground_recordings_are_short(sb, monkeypatch):
+    client, auth, fake, db, _ = sb
+    session = {**PLAYGROUND, "X-Api-Key-Id": "7"}
+    client.app.state.transcriber.text, client.app.state.transcriber.calls = "हाँ", []
+
+    class NoSeconds(FakeTranscriber):
+        async def transcribe(self, data, filename, language, prompt):
+            r = await super().transcribe(data, filename, language, prompt)
+            r.seconds = None
+            return r
+
+    client.app.state.transcriber = NoSeconds()
+    monkeypatch.setattr(settings, "playground_stt_seconds_per_day", 5)
+    ok = client.post("/v1/stt", headers=session, files={"file": ("a.wav", tone_wav(3), "audio/wav")})
+    assert ok.status_code == 200 and ok.json()["duration_seconds"] == 3.0
+    over = client.post("/v1/stt", headers=session, files={"file": ("b.wav", tone_wav(3), "audio/wav")})
+    assert over.status_code == 429 and "2 of 5 seconds left" in over.json()["detail"]
+    assert len(client.app.state.transcriber.calls) == 1  # refused before anything is transcribed
+    monkeypatch.setattr(settings, "playground_stt_seconds_per_day", 600)
+    monkeypatch.setattr(settings, "playground_stt_max_seconds", 2)
+    assert client.post("/v1/stt", headers=session, files={"file": ("c.wav", tone_wav(3), "audio/wav")}).status_code == 413
+    assert client.post("/v1/stt", headers=auth, files={"file": ("c.wav", tone_wav(3), "audio/wav")}).status_code == 200
+    monkeypatch.setattr(settings, "playground_stt_max_bytes", 1000)
+    big = client.post("/v1/stt", headers=session, files={"file": ("d.wav", tone_wav(1), "audio/wav")})
+    assert big.status_code == 413 and "playground" in big.json()["detail"]
+    junk = client.post("/v1/stt", headers=session, files={"file": ("e.wav", b"noise", "audio/wav")})
+    assert junk.status_code in (400, 413)
+    assert client.get("/v1/playground", headers=auth).status_code == 404  # keys have no playground
 
 
 def test_a_fine_tuned_voice_renders_with_its_adapter_and_hides_it(sb):

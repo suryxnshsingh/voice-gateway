@@ -61,16 +61,31 @@ def looks_like_session(token: str) -> bool:
     return token.count(".") == 2 and not token.startswith(("vg_", "vgs_"))
 
 
+# All a dashboard session may do: the playground's own calls. Not /v1/tokens, so a session can never
+# open the streaming WebSocket, and nothing else that would make it stand in for an API key.
+PLAYGROUND_ROUTES = {("POST", "/v1/tts"), ("POST", "/v1/stt"), ("GET", "/v1/playground")}
+
+
+def check_playground_request(request: Request) -> None:
+    """A dashboard session is for the playground, from the dashboard. The Origin check only stops casual
+    scripting (any client can send the header); the limits in playground.py are what hold."""
+    if (request.method, request.url.path) not in PLAYGROUND_ROUTES:
+        raise HTTPException(403, "A dashboard session only works in the dashboard's playground. Use an API key.")
+    if request.headers.get("origin") not in settings.playground_origins:
+        raise HTTPException(403, "The playground only works from the Dhvni dashboard. Use an API key from your app.")
+
+
 async def customer_from(request: Request) -> Customer:
     """FastAPI dependency for the public API: Authorization: Bearer <api key>, or a signed in dashboard
     session for the playground, checked by app.state.accounts (Supabase in production). A session names
     the API key it is billed to in X-Api-Key-Id; admins may leave it out. Raises 401 for an unknown key
-    and 403 for an account that isn't active."""
+    and 403 for an account that isn't active, or a session used outside the playground."""
     key = bearer(request.headers.get("authorization"))
     accounts = request.app.state.accounts
     if not key:
         customer = None
     elif looks_like_session(key):
+        check_playground_request(request)
         customer = await accounts.for_session(key, request.headers.get("x-api-key-id"))
     else:
         customer = await accounts.for_key(key)
