@@ -1,0 +1,36 @@
+# Paths are relative to training/ (run the trainer from there).
+# LoRA fine-tune of VoxCPM2 on Surya Sir, Suryabhan Singh (three 15 min lessons, 2026-10-30), NVIDIA L4 on acel4, PyTorch CUDA with autocast.
+# Values from the official LoRA config with steps/warmup/intervals scaled to a small single-speaker set
+# (docs: small datasets overfit within a few hundred steps; evaluate checkpoints 100-400).
+pretrained_path: openbmb/VoxCPM2   # HF repo id (downloaded/cached), or a local snapshot dir
+train_manifest: datasets/surya/train_final.jsonl
+val_manifest: datasets/surya/val_final.jsonl
+sample_rate: 16000
+out_sample_rate: 48000
+batch_size: 1
+grad_accum_steps: 8
+num_workers: 0
+preprocessing_num_workers: 1
+num_iters: 500
+max_steps: 500
+log_interval: 5
+valid_interval: 50
+save_interval: 50
+learning_rate: 0.0001
+weight_decay: 0.01
+warmup_steps: 30
+max_batch_tokens: 600
+max_grad_norm: 1.0
+save_path: ckpt/surya_r32
+tensorboard: ckpt/surya_r32/logs
+lambdas:
+  loss/diff: 1.0
+  loss/stop: 1.0
+lora:
+  enable_lm: true
+  enable_dit: true
+  enable_proj: false
+  r: 32
+  alpha: 32
+  dropout: 0.0
+frozen_bf16: true

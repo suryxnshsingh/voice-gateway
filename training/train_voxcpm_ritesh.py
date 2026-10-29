@@ -67,6 +67,7 @@ def train(
     tensorboard: str = "",
     lambdas: Dict[str, float] = {"loss/diff": 1.0, "loss/stop": 1.0},
     lora: dict = None,
+    frozen_bf16: bool = False,  # keep frozen base weights in bfloat16 (see below)
     config_path: str = "",
     max_grad_norm: float = 0.0,  # gradient clipping; 0 = disabled (backward compat)
     # Distribution options (for LoRA checkpoints)
@@ -106,6 +107,13 @@ def train(
     base_model = _model_cls.from_local(
         pretrained_path, optimize=False, training=True, lora_config=LoRAConfig(**lora) if lora else None
     )
+    # VoxCPM2 is released (and served) in bfloat16, and training mode upcasts every weight to fp32:
+    # 9.2 GB for the frozen base alone. Casting the frozen weights back is exact and halves that, so a
+    # LoRA run fits on a 24 GB L4 beside the serving worker. LoRA weights and the VAE stay fp32.
+    if frozen_bf16:
+        for name, param in base_model.named_parameters():
+            if not param.requires_grad and "audio_vae" not in name:
+                param.data = param.data.to(torch.bfloat16)
     tokenizer = base_model.text_tokenizer
 
     expected_sr = base_model.audio_vae.sample_rate

@@ -45,6 +45,27 @@ PYTORCH_MPS_HIGH_WATERMARK_RATIO=1.0 PYTORCH_MPS_LOW_WATERMARK_RATIO=0.8 PYTORCH
   - Small datasets overfit within a few hundred steps, so the right checkpoint is chosen by evaluation, not by taking the last one.
 - **Speed** on the M5 Pro: about 11 s per step, roughly 75 minutes for 400 steps.
 
+### On the GPU server (acel4, NVIDIA L4)
+
+About 2 s per step, so 500 steps take about 20 minutes. Gaurav Sir and Surya Sir were trained here on 2026-10-30.
+
+```bash
+# from the Mac: the trainer, the official source (without its .venv) and the dataset
+ssh acel4 'mkdir -p ~/vg-training/conf ~/vg-training/datasets'
+rsync -a --exclude .venv voxcpm-src train_voxcpm_ritesh.py eval_checkpoints.py acel4:vg-training/
+rsync -a conf/<name>_lora_cuda.yaml acel4:vg-training/conf/ && rsync -a datasets/<name> acel4:vg-training/datasets/
+# on acel4: point the manifests at the server's paths, build the env once, then train
+sed -i "s#/Users/suryxnshsingh/Developer/arivihan/voice-gateway/training/datasets/#/home/ubuntu/vg-training/datasets/#g" datasets/<name>/*_final.jsonl
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True HF_HUB_OFFLINE=1 \
+  nohup voxcpm-src/.venv/bin/python train_voxcpm_ritesh.py --config_path conf/<name>_lora_cuda.yaml > train-<name>.log 2>&1 &
+```
+
+- **Memory:** the run takes about 8 GB with `frozen_bf16: true`. Without it, it takes 12.5 GB.
+  - The serving worker (about 9.7 GB) and the other team's `~/voice-cloning` app (about 6.8 GB) don't leave room for both. Pause `~/voice-cloning` only after its owners agree, and restart it afterwards.
+  - Restart command: `cd ~/voice-cloning && nohup .venv/bin/python3 .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 >> work/api.log 2>&1 &`.
+- **`frozen_bf16`** is the second patch. Training mode upcasts every weight to fp32. VoxCPM2 is stored and served in bf16, so casting the frozen base weights back is exact, and it saves 4.6 GB. LoRA weights and the VAE stay fp32.
+- **Render the eval sentences on acel4** (`eval_checkpoints.py`, about 4 s per sentence). Score them on the Mac, where a speaker-only worker (`VG_WORKER_LOAD=speaker`) provides ECAPA.
+
 ## 3. Pick a checkpoint
 
 ```bash
@@ -85,3 +106,26 @@ Voice similarity is ECAPA against held-out real clips, averaged over three unsee
 - **Serving:** `training/models/ritesh-voxcpm2-step250` (merged, 5.4 GB) with the 8 s reference `datasets/ritesh/wavs/s00_0021.wav`. Start the worker with `VG_WORKER_TTS_MODEL` set to that path.
 - **Limitation:** one worker serves one model, so every voice on this worker is rendered by Ritesh Sir's fine-tune. For several fine-tuned teachers, either run one worker per teacher, or load per-voice LoRAs at runtime (`load_lora` / `set_lora_enabled`, slower per step than merged weights).
 - **Listening comparison:** `~/Desktop/ritesh_voice_ab/finetune/` (A = before, B = after).
+
+## Results: Gaurav Sir and Surya Sir, 2026-10-30
+
+Both were trained on acel4 (see "On the GPU server") from three 15-minute physics lessons each, with the Ritesh config at 500 steps. Since 8f9b0a7 a fine-tuned voice is served as a LoRA adapter on the base model, so neither needs a merged model or its own worker.
+
+| Teacher | Dataset | Checkpoint | Voice similarity, 30 s / 8 s ref | ASR error, 8 s ref |
+|---|---|---|---|---|
+| Gaurav Sir, base model | 191 clips, 31.4 min | base | 0.612 / 0.692 | 0.156 |
+| **Gaurav Sir** | | **step 350** | **0.672 / 0.705** | **0.156** |
+| Surya Sir (Suryabhan Singh), base model | 210 clips, 33.4 min | base | 0.696 / 0.692 | 0.156 |
+| **Surya Sir** | | **step 250** | **0.703 / 0.751** | **0.148** |
+
+- **Serving:**
+  - Gaurav Sir: `voice_e2af57e08f300ad6`, adapter `gaurav_step350`, 8 s reference `datasets/gaurav/wavs/s00_0046.wav`.
+  - Surya Sir: `voice_a6634d550542d3d2`, adapter `surya_step250`, 8 s reference `datasets/surya/wavs/s00_0031.wav`.
+  - Both are on suryansh@arivihan.com, next to Ritesh Sir.
+- **Through the live worker,** on one unseen sentence, similarity to a held-out real clip was:
+  - Gaurav Sir: 0.683 fine-tuned, 0.639 base.
+  - Surya Sir: 0.689 fine-tuned, 0.618 base.
+- **The gains are smaller than Ritesh Sir's.** The base model was already closer to these two voices, and with three eval sentences per checkpoint the scores are noisy. Listen before relying on the choice: `~/Desktop/gaurav_voice_ab/` and `~/Desktop/surya_voice_ab/` (A = base, B = fine-tuned, plus a real clip).
+- **Lesson audio is full of numbers,** so `finalize_dataset.py` dropped about a fifth of the clips for digits it could not respell (54 and 43).
+- **Transcripts:** gpt-transcribe sometimes ends a sentence with "。". Replace it with "।" before training.
+- **Downtime:** both runs needed `~/voice-cloning` paused, for about 75 minutes in all.
